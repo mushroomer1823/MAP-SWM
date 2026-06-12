@@ -101,7 +101,7 @@ def parse_args():
     # ===== anatomical-prior specific =====
     parser.add_argument(
         "--overlap_dir", type=str,
-        default="/home/heyifei/codes/test/atlas_overlap",
+        default="/home/hyf/swm_identification/multi-atlas-swm/atlas_overlap",
         help="Directory holding M_yeo_to_{atlas}.npy.",
     )
     parser.add_argument(
