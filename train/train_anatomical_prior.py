@@ -2,30 +2,30 @@
 #
 # Trainer for model_anatomical_prior.UnifiedSWMNet.
 #
-# Differences vs. train_demo_no_lobe.py:
-#   1. Loads UnifiedSWMNet from models.model_anatomical_prior, passing
-#      overlap_dir / temperature / alpha_init.
-#   2. Adds an extra yeo-CE auxiliary loss to supervise the mid heads
-#      (mid_head_start / mid_head_end) with weight --lambda_mid.
-#   3. Reports the mid heads' yeo accuracy as 'mid_yeo' under per-atlas
-#      metrics, mirroring train_atlas_ablation_kfold.py's format.
-#   4. Logs the 12 learnable alpha values after every epoch.
-#   5. Default save directory is .../anatomical_prior/ so checkpoints do
-#      not collide with no_lobe / lobe experiments.
-#
-# val_loss (used for early stopping) is SWM_CE + sum_atlas atlas_CE
-# (NO mid CE), matching train_demo_no_lobe.py / train_atlas_ablation_kfold.py
-# so best checkpoints are directly comparable across all three setups.
+# Main features:
+#   1. Uses anatomical prior as a gated residual refinement in the model.
+#   2. Supports configurable feature dimensions through --global_feat_dim and
+#      --endpoint_dim, so changing 1024 -> 512 does not require editing model code.
+#   3. Saves every run under /data/hyf/swm_identification/train_result/<param-tag>/,
+#      including config, best/final checkpoints, per-epoch metrics, test metrics,
+#      convergence curves, parameter statistics, and learned alpha/gate values.
 
 import argparse
 import csv
+import json
 import os
+import re
 import sys
+from datetime import datetime
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from sklearn.metrics import precision_recall_fscore_support
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PARENT_DIR = os.path.dirname(CURRENT_DIR)
@@ -45,7 +45,7 @@ from models.model_anatomical_prior import UnifiedSWMNet  # noqa: E402
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Train UnifiedSWMNet with anatomical-prior conditioning "
+            "Train UnifiedSWMNet with gated-residual anatomical-prior conditioning "
             "(yeo mid + fixed overlap matrices M)."
         )
     )
@@ -92,6 +92,20 @@ def parse_args():
         choices=["pointnet", "pointnet++", "pointmlp", "dgcnn"],
     )
 
+    # ===== dimension control =====
+    parser.add_argument(
+        "--global_feat_dim", type=int, default=1024,
+        help="Backbone global feature dimension, e.g. 1024 or 512.",
+    )
+    parser.add_argument(
+        "--endpoint_dim", type=int, default=256,
+        help="Endpoint feature dimension after endpoint_mlp.",
+    )
+    parser.add_argument(
+        "--swm_hidden_dim", type=int, default=256,
+        help="Hidden dimension of the SWM binary classification head.",
+    )
+
     # ===== atlas loss control =====
     parser.add_argument(
         "--train_atlases", type=str, default="all",
@@ -112,19 +126,37 @@ def parse_args():
         "--temperature", type=float, default=1.0,
         help=(
             "Temperature applied to mid logits before softmax when forming "
-            "the prior. >1 softens the prior (more forgiving when mid is "
-            "wrong), <1 sharpens it. Default 1.0 = no temperature scaling."
+            "the prior. >1 softens the prior, <1 sharpens it."
         ),
     )
     parser.add_argument(
         "--alpha_init", type=float, default=1.0,
-        help="Initial value for every learnable alpha[atlas_pos].",
+        help="Initial residual scale alpha[atlas_pos].",
+    )
+    parser.add_argument(
+        "--gate_init", type=float, default=-6.0,
+        help=(
+            "Initial raw gate value. sigmoid(-6)≈0.0025, so the model starts "
+            "close to the no-prior baseline. Use 0 for stronger initial prior."
+        ),
     )
 
-    # ===== save =====
+    # ===== save / result logging =====
+    parser.add_argument(
+        "--result_root", type=str,
+        default="/data/hyf/swm_identification/train_result",
+        help="Root directory for all training outputs.",
+    )
+    parser.add_argument(
+        "--run_name", type=str, default=None,
+        help="Optional manual run folder name. If not set, a parameter-based name is generated.",
+    )
     parser.add_argument(
         "--save_path", type=str, default=None,
-        help="Path to save best model. For K-fold _fold{i} is appended.",
+        help=(
+            "Optional explicit best model path. If omitted, best_model.pth is "
+            "saved inside the generated result directory."
+        ),
     )
 
     return parser.parse_args()
@@ -178,18 +210,59 @@ def build_model(args, device):
         overlap_dir=args.overlap_dir,
         temperature=args.temperature,
         alpha_init=args.alpha_init,
+        gate_init=args.gate_init,
+        global_feat_dim=args.global_feat_dim,
+        endpoint_dim=args.endpoint_dim,
+        swm_hidden_dim=args.swm_hidden_dim,
     ).to(device)
     return model
 
 
-def make_save_path(args, fold=None):
+def safe_tag(x):
+    x = str(x)
+    x = x.replace("+", "p").replace("-", "m").replace(".", "p")
+    x = re.sub(r"[^A-Za-z0-9_=,.-]+", "_", x)
+    return x.strip("_")
+
+
+def make_run_dir(args):
+    if args.run_name:
+        name = safe_tag(args.run_name)
+    else:
+        atlas_tag = "all" if args.train_atlases == "all" else args.train_atlases.replace(",", "-")
+        name = "_".join([
+            "anatomicalPriorGated",
+            f"model={args.model_type}",
+            f"gdim={args.global_feat_dim}",
+            f"edim={args.endpoint_dim}",
+            f"swmhid={args.swm_hidden_dim}",
+            f"lr={args.lr}",
+            f"wd={args.weight_decay}",
+            f"bs={args.batch_size}",
+            f"ep={args.epochs}",
+            f"lambdaMid={args.lambda_mid}",
+            f"temp={args.temperature}",
+            f"alpha={args.alpha_init}",
+            f"gate={args.gate_init}",
+            f"atlas={atlas_tag}",
+            f"seed={args.seed}",
+        ])
+        name = safe_tag(name)
+
+    # Add timestamp to avoid accidental overwrite while still keeping parameters in the folder name.
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = os.path.join(args.result_root, f"{name}_{timestamp}")
+    os.makedirs(run_dir, exist_ok=True)
+    return run_dir
+
+
+def make_save_path(args, run_dir, fold=None):
     if args.save_path is None:
-        save_dir = "/data/hyf/swm_identification/models/anatomical_prior"
-        filename = f"best_unified_{args.model_type}_yeoPrior"
+        filename = "best_model"
         if fold is not None:
             filename += f"_fold{fold}"
         filename += ".pth"
-        return os.path.join(save_dir, filename)
+        return os.path.join(run_dir, filename)
 
     if fold is None:
         return args.save_path
@@ -199,8 +272,151 @@ def make_save_path(args, fold=None):
     return f"{base}_fold{fold}{ext}"
 
 
+def save_json(obj, path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False, default=str)
+
+
+def count_parameters(model):
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return {"total_params": int(total), "trainable_params": int(trainable)}
+
+
+def save_parameter_summary(model, output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+    summary = count_parameters(model)
+
+    csv_path = os.path.join(output_dir, "model_parameters.csv")
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=["name", "shape", "numel", "requires_grad"]
+        )
+        writer.writeheader()
+        for name, param in model.named_parameters():
+            writer.writerow({
+                "name": name,
+                "shape": list(param.shape),
+                "numel": param.numel(),
+                "requires_grad": param.requires_grad,
+            })
+
+    txt_path = os.path.join(output_dir, "model_summary.txt")
+    with open(txt_path, "w") as f:
+        f.write("Model parameter summary\n")
+        f.write("=======================\n")
+        f.write(f"total_params: {summary['total_params']}\n")
+        f.write(f"trainable_params: {summary['trainable_params']}\n\n")
+        f.write(str(model))
+        f.write("\n")
+
+    return summary
+
+
+def mean_metric(metrics, metric_name="f1", include_mid=False):
+    values = []
+    for atlas in ATLAS_LIST:
+        for pos in ["start", "end"]:
+            key = f"{atlas}_{pos}"
+            if key in metrics:
+                v = metrics[key].get(metric_name, float("nan"))
+                if v == v:  # not nan
+                    values.append(v)
+    if include_mid:
+        for pos in ["start", "end"]:
+            key = f"mid_{pos}"
+            if key in metrics:
+                v = metrics[key].get(metric_name, float("nan"))
+                if v == v:
+                    values.append(v)
+    if not values:
+        return float("nan")
+    return float(sum(values) / len(values))
+
+
+def flatten_metrics(metrics, prefix):
+    row = {}
+    for key, m in metrics.items():
+        for metric_name, value in m.items():
+            try:
+                row[f"{prefix}_{key}_{metric_name}"] = float(value)
+            except Exception:
+                row[f"{prefix}_{key}_{metric_name}"] = value
+    row[f"{prefix}_atlas_mean_acc"] = mean_metric(metrics, "accuracy")
+    row[f"{prefix}_atlas_mean_precision"] = mean_metric(metrics, "precision")
+    row[f"{prefix}_atlas_mean_recall"] = mean_metric(metrics, "recall")
+    row[f"{prefix}_atlas_mean_f1"] = mean_metric(metrics, "f1")
+    return row
+
+
+def write_history_csv(history, path):
+    if not history:
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fieldnames = []
+    for row in history:
+        for k in row.keys():
+            if k not in fieldnames:
+                fieldnames.append(k)
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in history:
+            writer.writerow(row)
+
+
+def save_curves(history, output_dir, fold=None):
+    if not history:
+        return
+    os.makedirs(output_dir, exist_ok=True)
+    tag = "single" if fold is None else f"fold{fold}"
+    epochs = [r["epoch"] for r in history]
+
+    def plot_curve(y_keys, ylabel, filename):
+        plt.figure(figsize=(8, 5))
+        for key in y_keys:
+            y = [r.get(key, float("nan")) for r in history]
+            plt.plot(epochs, y, label=key)
+        plt.xlabel("Epoch")
+        plt.ylabel(ylabel)
+        plt.title(f"{ylabel} curve ({tag})")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, filename), dpi=300)
+        plt.close()
+
+    plot_curve(["train_loss", "val_loss"], "Loss", f"convergence_loss_{tag}.png")
+    plot_curve(
+        ["train_swm_f1", "val_swm_f1", "train_atlas_mean_f1", "val_atlas_mean_f1"],
+        "F1",
+        f"convergence_f1_{tag}.png",
+    )
+    plot_curve(
+        ["train_atlas_mean_acc", "val_atlas_mean_acc"],
+        "Accuracy",
+        f"convergence_accuracy_{tag}.png",
+    )
+
+
+def write_snapshot_csv(snapshot_rows, path):
+    if not snapshot_rows:
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fieldnames = []
+    for r in snapshot_rows:
+        for k in r.keys():
+            if k not in fieldnames:
+                fieldnames.append(k)
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for r in snapshot_rows:
+            writer.writerow(r)
+
+
 def print_metrics_summary(metrics, label="Test", include_mid=True):
-    """SWM binary + per-atlas mean(start, end) acc, with optional mid_yeo row."""
+    """SWM binary + per-atlas mean(start, end) metrics, with optional mid_yeo row."""
     swm = metrics.get("swm")
     if swm is not None:
         print(
@@ -213,22 +429,25 @@ def print_metrics_summary(metrics, label="Test", include_mid=True):
     if include_mid:
         rows.append(("mid_yeo", "mid"))
 
-    print(f"  {label} per-atlas mean(start, end) accuracy:")
+    print(f"  {label} per-atlas mean(start, end):")
     for display, prefix in rows:
         s_key = f"{prefix}_start"
         e_key = f"{prefix}_end"
         if s_key not in metrics or e_key not in metrics:
             continue
-        s_acc = metrics[s_key]["accuracy"]
-        e_acc = metrics[e_key]["accuracy"]
+        s = metrics[s_key]
+        e = metrics[e_key]
         print(
-            f"    {display}: mean_acc={0.5 * (s_acc + e_acc):.4f} "
-            f"(start={s_acc:.4f}, end={e_acc:.4f})"
+            f"    {display}: "
+            f"acc={0.5 * (s['accuracy'] + e['accuracy']):.4f}, "
+            f"precision={0.5 * (s['precision'] + e['precision']):.4f}, "
+            f"recall={0.5 * (s['recall'] + e['recall']):.4f}, "
+            f"f1={0.5 * (s['f1'] + e['f1']):.4f} "
+            f"(start_acc={s['accuracy']:.4f}, end_acc={e['accuracy']:.4f})"
         )
 
 
 def format_alpha(alpha_dict):
-    """One-line dump of all 12 alpha values, ordered by ATLAS_LIST."""
     parts = []
     for atlas in ATLAS_LIST:
         for pos in ["start", "end"]:
@@ -237,7 +456,17 @@ def format_alpha(alpha_dict):
     return ", ".join(parts)
 
 
-def metrics_to_csv_rows(metrics, fold=None, include_mid=True):
+def format_gate(gate_dict):
+    parts = []
+    for atlas in ATLAS_LIST:
+        for pos in ["start", "end"]:
+            key = f"{atlas}_{pos}"
+            g = gate_dict[key]["sigmoid"]
+            parts.append(f"{key}={g:.4f}")
+    return ", ".join(parts)
+
+
+def metrics_to_csv_rows(metrics, fold=None, split="test", include_mid=True):
     fold_str = "single" if fold is None else f"fold{fold}"
     pairs = [(atlas, atlas) for atlas in ATLAS_LIST]
     if include_mid:
@@ -247,7 +476,7 @@ def metrics_to_csv_rows(metrics, fold=None, include_mid=True):
     swm = metrics.get("swm")
     if swm is not None:
         rows.append({
-            "fold": fold_str, "atlas": "swm", "position": "binary",
+            "split": split, "fold": fold_str, "atlas": "swm", "position": "binary",
             "accuracy": swm["accuracy"], "f1": swm["f1"],
             "precision": swm["precision"], "recall": swm["recall"],
         })
@@ -259,7 +488,7 @@ def metrics_to_csv_rows(metrics, fold=None, include_mid=True):
                 continue
             m = metrics[key]
             rows.append({
-                "fold": fold_str, "atlas": atlas_name, "position": pos,
+                "split": split, "fold": fold_str, "atlas": atlas_name, "position": pos,
                 "accuracy": m["accuracy"], "f1": m["f1"],
                 "precision": m["precision"], "recall": m["recall"],
             })
@@ -268,7 +497,7 @@ def metrics_to_csv_rows(metrics, fold=None, include_mid=True):
 
 def write_metrics_csv(rows, csv_path):
     os.makedirs(os.path.dirname(csv_path), exist_ok=True)
-    fieldnames = ["fold", "atlas", "position", "accuracy", "f1", "precision", "recall"]
+    fieldnames = ["split", "fold", "atlas", "position", "accuracy", "f1", "precision", "recall"]
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -278,7 +507,7 @@ def write_metrics_csv(rows, csv_path):
                 v = row_out.get(k)
                 row_out[k] = f"{v:.6f}" if isinstance(v, float) else v
             writer.writerow(row_out)
-    print(f"Saved test metrics to: {csv_path}")
+    print(f"Saved metrics to: {csv_path}")
 
 
 def mean_std_ignore_nan(values):
@@ -410,8 +639,8 @@ def eval_one_epoch(model, loader, criterion, device, train_atlases):
         outputs = model(X)
         swm_mask = atlas_targets["swm"] == 1
 
-        # Val loss for checkpoint selection: SWM + atlas CEs only (NO mid CE),
-        # matching the convention in train_demo_no_lobe / train_atlas_ablation_kfold.
+        # Val/test loss for checkpoint selection: SWM + atlas CEs only (NO mid CE),
+        # matching the convention in no-prior baselines.
         batch_loss = criterion(outputs["swm"], atlas_targets["swm"])
 
         all_swm_preds.append(outputs["swm"].argmax(dim=1).cpu())
@@ -464,7 +693,7 @@ def eval_one_epoch(model, loader, criterion, device, train_atlases):
 # =====================================================
 # One split / one fold
 # =====================================================
-def run_one_split(args, train_set, val_set, test_set, device, save_path, train_atlases, fold=None):
+def run_one_split(args, train_set, val_set, test_set, device, save_path, train_atlases, run_dir, fold=None):
     train_loader = DataLoader(
         train_set, batch_size=args.batch_size, shuffle=True,
         num_workers=args.num_workers, pin_memory=True,
@@ -480,8 +709,21 @@ def run_one_split(args, train_set, val_set, test_set, device, save_path, train_a
     print("Dataloaders ready")
 
     model = build_model(args, device)
-    print("Model initialized (anatomical-prior)")
-    print(f"  temperature={args.temperature}  lambda_mid={args.lambda_mid}  alpha_init={args.alpha_init}")
+    print("Model initialized (gated-residual anatomical prior)")
+    print(
+        f"  global_feat_dim={args.global_feat_dim} endpoint_dim={args.endpoint_dim} "
+        f"fused_dim={model.fused_dim}"
+    )
+    print(
+        f"  temperature={args.temperature}  lambda_mid={args.lambda_mid}  "
+        f"alpha_init={args.alpha_init}  gate_init={args.gate_init}"
+    )
+
+    param_summary = save_parameter_summary(model, run_dir)
+    print(
+        f"  total_params={param_summary['total_params']} "
+        f"trainable_params={param_summary['trainable_params']}"
+    )
 
     optimizer = torch.optim.Adam(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay,
@@ -489,9 +731,12 @@ def run_one_split(args, train_set, val_set, test_set, device, save_path, train_a
     criterion = nn.CrossEntropyLoss()
 
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    print(f"Save the trained model to: {save_path}")
+    print(f"Save the best model to: {save_path}")
 
     best_val_loss = float("inf")
+    best_epoch = -1
+    history = []
+    snapshot_rows = []
 
     for epoch in range(1, args.epochs + 1):
         if fold is None:
@@ -514,17 +759,85 @@ def run_one_split(args, train_set, val_set, test_set, device, save_path, train_a
         print(f"Val Loss: {val_loss:.4f}")
         print_metrics_summary(val_metrics, label="Val")
 
-        # Always print alpha values — main diagnostic for whether the
-        # model has decided to trust the prior on each (atlas, pos) head.
-        print(f"  alpha: {format_alpha(model.alpha_snapshot())}")
+        alpha = model.alpha_snapshot()
+        gate = model.gate_snapshot()
+        prior_weight = model.prior_weight_snapshot()
+        print(f"  alpha: {format_alpha(alpha)}")
+        print(f"  gate(sigmoid): {format_gate(gate)}")
+
+        row = {
+            "fold": "single" if fold is None else fold,
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "train_swm_acc": train_metrics["swm"]["accuracy"],
+            "train_swm_precision": train_metrics["swm"]["precision"],
+            "train_swm_recall": train_metrics["swm"]["recall"],
+            "train_swm_f1": train_metrics["swm"]["f1"],
+            "val_swm_acc": val_metrics["swm"]["accuracy"],
+            "val_swm_precision": val_metrics["swm"]["precision"],
+            "val_swm_recall": val_metrics["swm"]["recall"],
+            "val_swm_f1": val_metrics["swm"]["f1"],
+            "train_atlas_mean_acc": mean_metric(train_metrics, "accuracy"),
+            "train_atlas_mean_precision": mean_metric(train_metrics, "precision"),
+            "train_atlas_mean_recall": mean_metric(train_metrics, "recall"),
+            "train_atlas_mean_f1": mean_metric(train_metrics, "f1"),
+            "val_atlas_mean_acc": mean_metric(val_metrics, "accuracy"),
+            "val_atlas_mean_precision": mean_metric(val_metrics, "precision"),
+            "val_atlas_mean_recall": mean_metric(val_metrics, "recall"),
+            "val_atlas_mean_f1": mean_metric(val_metrics, "f1"),
+        }
+        row.update(flatten_metrics(train_metrics, "train"))
+        row.update(flatten_metrics(val_metrics, "val"))
+        history.append(row)
+
+        snap = {"fold": "single" if fold is None else fold, "epoch": epoch}
+        for k, v in alpha.items():
+            snap[f"alpha_{k}"] = v
+        for k, v in gate.items():
+            snap[f"gate_raw_{k}"] = v["raw"]
+            snap[f"gate_sigmoid_{k}"] = v["sigmoid"]
+        for k, v in prior_weight.items():
+            snap[f"effective_prior_weight_{k}"] = v
+        snapshot_rows.append(snap)
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save(model.state_dict(), save_path)
+            best_epoch = epoch
+            torch.save({
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "best_val_loss": best_val_loss,
+                "args": vars(args),
+                "param_summary": param_summary,
+            }, save_path)
             print(f"Saved new best model at epoch {epoch} (Val Loss: {val_loss:.4f})")
 
+        # Write after every epoch so interrupted runs still keep useful logs.
+        tag = "single" if fold is None else f"fold{fold}"
+        write_history_csv(history, os.path.join(run_dir, f"epoch_metrics_{tag}.csv"))
+        write_snapshot_csv(snapshot_rows, os.path.join(run_dir, f"prior_alpha_gate_{tag}.csv"))
+        save_curves(history, run_dir, fold=fold)
+
+    final_path = os.path.join(run_dir, "final_model.pth" if fold is None else f"final_model_fold{fold}.pth")
+    torch.save({
+        "epoch": args.epochs,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "args": vars(args),
+        "param_summary": param_summary,
+    }, final_path)
+    print(f"Saved final model to: {final_path}")
+
     print("\nTesting best model")
-    model.load_state_dict(torch.load(save_path, map_location=device))
+    checkpoint = torch.load(save_path, map_location=device)
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        model.load_state_dict(checkpoint["model_state_dict"])
+    else:
+        # Backward compatibility with old pure state_dict checkpoints.
+        model.load_state_dict(checkpoint)
+
     test_loss, test_metrics = eval_one_epoch(
         model=model, loader=test_loader, criterion=criterion,
         device=device, train_atlases=train_atlases,
@@ -532,14 +845,32 @@ def run_one_split(args, train_set, val_set, test_set, device, save_path, train_a
     print(f"Test Loss: {test_loss:.4f}")
     print_metrics_summary(test_metrics, label="Test")
     print(f"  final alpha: {format_alpha(model.alpha_snapshot())}")
+    print(f"  final gate(sigmoid): {format_gate(model.gate_snapshot())}")
+
+    result_json = {
+        "fold": fold,
+        "best_epoch": best_epoch,
+        "best_val_loss": best_val_loss,
+        "test_loss": test_loss,
+        "save_path": save_path,
+        "final_path": final_path,
+        "alpha": model.alpha_snapshot(),
+        "gate": model.gate_snapshot(),
+        "effective_prior_weight": model.prior_weight_snapshot(),
+        "param_summary": param_summary,
+    }
+    save_json(result_json, os.path.join(run_dir, "result_summary.json" if fold is None else f"result_summary_fold{fold}.json"))
 
     return {
         "fold": fold,
+        "best_epoch": best_epoch,
         "best_val_loss": best_val_loss,
         "test_loss": test_loss,
         "test_metrics": test_metrics,
         "save_path": save_path,
         "alpha": model.alpha_snapshot(),
+        "gate": model.gate_snapshot(),
+        "effective_prior_weight": model.prior_weight_snapshot(),
     }
 
 
@@ -548,6 +879,10 @@ def run_one_split(args, train_set, val_set, test_set, device, save_path, train_a
 # =====================================================
 def main():
     args = parse_args()
+
+    run_dir = make_run_dir(args)
+    print(f"Result directory: {run_dir}")
+    save_json(vars(args), os.path.join(run_dir, "config.json"))
 
     device = torch.device(
         f"cuda:{args.gpu}" if args.gpu >= 0 and torch.cuda.is_available() else "cpu"
@@ -571,19 +906,16 @@ def main():
         )
         print("Dataset built")
 
-        save_path = make_save_path(args, fold=None)
+        save_path = make_save_path(args, run_dir=run_dir, fold=None)
         result = run_one_split(
             args=args, train_set=train_set, val_set=val_set, test_set=test_set,
             device=device, save_path=save_path,
-            train_atlases=train_atlases, fold=None,
+            train_atlases=train_atlases, run_dir=run_dir, fold=None,
         )
 
-        csv_path = os.path.join(
-            os.path.dirname(save_path),
-            f"test_metrics_{args.model_type}_yeoPrior.csv",
-        )
-        rows = metrics_to_csv_rows(result["test_metrics"], fold=None)
-        write_metrics_csv(rows, csv_path)
+        rows = metrics_to_csv_rows(result["test_metrics"], fold=None, split="test")
+        write_metrics_csv(rows, os.path.join(run_dir, "test_metrics.csv"))
+        print(f"All outputs saved under: {run_dir}")
         return
 
     print(f"Using {args.k_fold}-fold cross validation")
@@ -602,27 +934,41 @@ def main():
         print(f"Running fold {fold}/{args.k_fold}")
         print("=" * 80)
 
-        save_path = make_save_path(args, fold=fold)
+        save_path = make_save_path(args, run_dir=run_dir, fold=fold)
         result = run_one_split(
             args=args,
             train_set=fold_info["train_set"],
             val_set=fold_info["val_set"],
             test_set=fold_info["test_set"],
             device=device, save_path=save_path,
-            train_atlases=train_atlases, fold=fold,
+            train_atlases=train_atlases,
+            run_dir=run_dir,
+            fold=fold,
         )
         fold_results.append(result)
 
     summarize_kfold_results(fold_results)
 
-    csv_path = os.path.join(
-        os.path.dirname(make_save_path(args, fold=fold_results[0]["fold"])),
-        f"test_metrics_{args.model_type}_yeoPrior.csv",
-    )
     all_rows = []
     for r in fold_results:
-        all_rows.extend(metrics_to_csv_rows(r["test_metrics"], fold=r["fold"]))
-    write_metrics_csv(all_rows, csv_path)
+        all_rows.extend(metrics_to_csv_rows(r["test_metrics"], fold=r["fold"], split="test"))
+    write_metrics_csv(all_rows, os.path.join(run_dir, "test_metrics_all_folds.csv"))
+    save_json({
+        "fold_results": [
+            {
+                "fold": r["fold"],
+                "best_epoch": r["best_epoch"],
+                "best_val_loss": r["best_val_loss"],
+                "test_loss": r["test_loss"],
+                "save_path": r["save_path"],
+                "alpha": r["alpha"],
+                "gate": r["gate"],
+                "effective_prior_weight": r["effective_prior_weight"],
+            }
+            for r in fold_results
+        ]
+    }, os.path.join(run_dir, "kfold_result_summary.json"))
+    print(f"All outputs saved under: {run_dir}")
 
 
 if __name__ == "__main__":

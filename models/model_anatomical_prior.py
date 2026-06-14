@@ -2,12 +2,15 @@
 #
 # SWM classifier with anatomical-prior conditioning.
 #
-# The mid (yeo, 7 networks) signal is NOT injected into the feature path
-# (no cond_proj, no mid_embed). Instead, each atlas head's logits get an
-# additive log-prior term derived from a fixed anatomical overlap matrix:
+# This version injects the anatomical prior as a gated residual refinement:
 #
-#     atlas_logits[A, pos] = atlas_head[A, pos](z)
-#                          + alpha[A, pos] * log( softmax(mid_pos_logits / tau) @ M[A] )
+#     atlas_logits[A, pos] = base_head[A, pos](z)
+#                          + sigmoid(gate[A, pos]) * alpha[A, pos]
+#                            * log( softmax(mid_pos_logits / tau) @ M[A] )
+#
+# The direct streamline + endpoint path is therefore always preserved.  If the
+# anatomical prior is unhelpful for a given atlas/position head, the learnable
+# gate can stay close to 0 and the model degenerates to the no-prior baseline.
 #
 # M[A] is a fixed (mid_dim, n_roi_A) matrix of P(atlas_roi | yeo_class),
 # computed offline from voxel overlap on a common cortical region.
@@ -15,8 +18,8 @@
 # mid_*_logits are detached when forming the prior so:
 #   - atlas CE never flows back into mid_head or the backbone via the prior
 #   - mid_head is supervised purely by its own CE (yeo label)
-#   - backbone is supervised by the same losses as model_no_lobe_prior
-#     (SWM + atlas CEs), so that baseline is a strict lower bound
+#   - backbone still receives gradients from SWM + atlas CEs through the direct
+#     base_head path.
 
 import os
 
@@ -40,27 +43,32 @@ class UnifiedSWMNet(nn.Module):
         overlap_dir="/home/heyifei/codes/test/atlas_overlap",
         temperature=1.0,
         alpha_init=1.0,
+        gate_init=-6.0,
+        global_feat_dim=1024,
+        endpoint_dim=256,
+        swm_hidden_dim=256,
         eps=1e-8,
     ):
         super().__init__()
 
+        self.global_dim = int(global_feat_dim)
+        self.endpoint_dim = int(endpoint_dim)
+        self.swm_hidden_dim = int(swm_hidden_dim)
+
         # ========= 1) backbone =========
         backbone = backbone.lower()
         if backbone == "pointnet":
-            self.pointnet = PointNetEncoder(in_dim=3, global_feat_dim=1024)
+            self.pointnet = PointNetEncoder(in_dim=3, global_feat_dim=self.global_dim)
         elif backbone == "pointnet++":
-            self.pointnet = PointNetPPEncoder(in_dim=3, global_feat_dim=1024)
+            self.pointnet = PointNetPPEncoder(in_dim=3, global_feat_dim=self.global_dim)
         elif backbone == "dgcnn":
-            self.pointnet = DGCNNEncoder(in_dim=3, global_feat_dim=1024)
+            self.pointnet = DGCNNEncoder(in_dim=3, global_feat_dim=self.global_dim)
         elif backbone == "pointmlp":
-            self.pointnet = PointMLPEncoder(in_dim=3, global_feat_dim=1024)
+            self.pointnet = PointMLPEncoder(in_dim=3, global_feat_dim=self.global_dim)
         else:
             raise ValueError(f"Unknown backbone: {backbone}")
 
-        self.global_dim = 1024
-
         # ========= 2) endpoint MLP =========
-        self.endpoint_dim = 256
         self.endpoint_mlp = nn.Sequential(
             nn.Linear(3, 64),
             nn.ReLU(),
@@ -68,13 +76,13 @@ class UnifiedSWMNet(nn.Module):
             nn.ReLU(),
             nn.Linear(128, self.endpoint_dim),
         )
-        self.fused_dim = self.global_dim + 2 * self.endpoint_dim  # 1536
+        self.fused_dim = self.global_dim + 2 * self.endpoint_dim
 
         # ========= 3) SWM / non-SWM binary head =========
         self.swm_head = nn.Sequential(
-            nn.Linear(self.fused_dim, 256),
+            nn.Linear(self.fused_dim, self.swm_hidden_dim),
             nn.ReLU(),
-            nn.Linear(256, 2),
+            nn.Linear(self.swm_hidden_dim, 2),
         )
 
         # ========= 4) mid (yeo) heads — independent for start / end =========
@@ -82,7 +90,7 @@ class UnifiedSWMNet(nn.Module):
         self.mid_head_start = nn.Linear(self.fused_dim, mid_dim)
         self.mid_head_end = nn.Linear(self.fused_dim, mid_dim)
 
-        # ========= 5) atlas heads (z → ROI directly, no bottleneck) =========
+        # ========= 5) direct atlas heads: baseline path z -> ROI =========
         self.atlas_heads = nn.ModuleDict()
         for atlas, n_roi in atlas_roi_dims.items():
             self.atlas_heads[atlas] = nn.ModuleDict({
@@ -90,12 +98,17 @@ class UnifiedSWMNet(nn.Module):
                 "end": nn.Linear(self.fused_dim, n_roi),
             })
 
-        # ========= 6) per-(atlas, pos) learnable prior weight alpha (A2) =====
-        # Each of the 12 entries can drift independently; an atlas+pos for
-        # which the prior is unhelpful will see its alpha shrink toward 0,
-        # restoring the no-prior baseline for that head.
+        # ========= 6) gated residual prior weights ==========================
+        # alpha controls residual magnitude/sign; gate controls whether the
+        # anatomical prior is used. gate_init=-6 gives sigmoid(gate)≈0.0025,
+        # so the model starts very close to the direct no-prior baseline.
         self.alpha = nn.ParameterDict({
             f"{atlas}_{pos}": nn.Parameter(torch.tensor(float(alpha_init)))
+            for atlas in atlas_roi_dims
+            for pos in ["start", "end"]
+        })
+        self.gate = nn.ParameterDict({
+            f"{atlas}_{pos}": nn.Parameter(torch.tensor(float(gate_init)))
             for atlas in atlas_roi_dims
             for pos in ["start", "end"]
         })
@@ -120,9 +133,6 @@ class UnifiedSWMNet(nn.Module):
             self.register_buffer(f"M_{atlas}", torch.from_numpy(M.astype(np.float32)))
 
         # ========= 8) temperature and numerical floor ========================
-        # Registered as buffers so they move with .to(device) and survive
-        # checkpoint round-trips. Temperature defaults to 1.0 — set >1 to
-        # soften the prior (less harsh when mid is wrong), <1 to sharpen.
         self.register_buffer("temperature", torch.tensor(float(temperature)))
         self.register_buffer("eps", torch.tensor(float(eps)))
 
@@ -138,18 +148,23 @@ class UnifiedSWMNet(nn.Module):
         prior = mid_prob @ getattr(self, f"M_{atlas}")    # (B, n_roi)
         return torch.log(prior + self.eps)
 
+    def _apply_gated_residual_prior(self, raw_logits, log_prior, atlas, pos):
+        key = f"{atlas}_{pos}"
+        gate = torch.sigmoid(self.gate[key])
+        return raw_logits + gate * self.alpha[key] * log_prior
+
     def forward(self, fiber):
         """
         fiber: (B, 3, N)
         """
-        global_feat = self.pointnet(fiber)                  # (B, 1024)
+        global_feat = self.pointnet(fiber)                  # (B, global_dim)
 
         start = fiber[:, :, 0]                              # (B, 3)
         end = fiber[:, :, -1]                               # (B, 3)
-        start_feat = self.endpoint_mlp(start)               # (B, 256)
-        end_feat = self.endpoint_mlp(end)                   # (B, 256)
+        start_feat = self.endpoint_mlp(start)               # (B, endpoint_dim)
+        end_feat = self.endpoint_mlp(end)                   # (B, endpoint_dim)
 
-        z = torch.cat([global_feat, start_feat, end_feat], dim=1)  # (B, 1536)
+        z = torch.cat([global_feat, start_feat, end_feat], dim=1)
 
         swm_logits = self.swm_head(z)
         mid_start_logits = self.mid_head_start(z)
@@ -168,11 +183,17 @@ class UnifiedSWMNet(nn.Module):
             raw_start = heads["start"](z)
             raw_end = heads["end"](z)
 
-            outputs[f"{atlas}_start"] = (
-                raw_start + self.alpha[f"{atlas}_start"] * log_prior_start
+            outputs[f"{atlas}_start"] = self._apply_gated_residual_prior(
+                raw_logits=raw_start,
+                log_prior=log_prior_start,
+                atlas=atlas,
+                pos="start",
             )
-            outputs[f"{atlas}_end"] = (
-                raw_end + self.alpha[f"{atlas}_end"] * log_prior_end
+            outputs[f"{atlas}_end"] = self._apply_gated_residual_prior(
+                raw_logits=raw_end,
+                log_prior=log_prior_end,
+                atlas=atlas,
+                pos="end",
             )
 
         return outputs
@@ -180,3 +201,20 @@ class UnifiedSWMNet(nn.Module):
     def alpha_snapshot(self):
         """Return a plain dict of current alpha values for logging."""
         return {k: v.detach().cpu().item() for k, v in self.alpha.items()}
+
+    def gate_snapshot(self):
+        """Return raw gate and sigmoid(gate) values for logging."""
+        out = {}
+        for k, v in self.gate.items():
+            raw = v.detach().cpu().item()
+            out[k] = {"raw": raw, "sigmoid": float(torch.sigmoid(v.detach()).cpu().item())}
+        return out
+
+    def prior_weight_snapshot(self):
+        """Return effective prior weights: sigmoid(gate) * alpha."""
+        out = {}
+        for k in self.alpha.keys():
+            out[k] = (
+                torch.sigmoid(self.gate[k].detach()) * self.alpha[k].detach()
+            ).cpu().item()
+        return out
