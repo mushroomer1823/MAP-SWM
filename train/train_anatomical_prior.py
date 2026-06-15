@@ -8,7 +8,7 @@
 #      --endpoint_dim, so changing 1024 -> 512 does not require editing model code.
 #   3. Saves every run under /data/hyf/swm_identification/train_result/<param-tag>/,
 #      including config, best/final checkpoints, per-epoch metrics, test metrics,
-#      convergence curves, parameter statistics, and learned alpha/gate values.
+#      convergence curves, parameter statistics, and learned gate values.
 
 import argparse
 import csv
@@ -83,6 +83,13 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-5)
     parser.add_argument("--num_workers", type=int, default=64)
+    parser.add_argument(
+        "--early_stop_patience", type=int, default=10,
+        help=(
+            "Stop training if val_loss does not improve for this many "
+            "consecutive epochs. Set to 0 (or any value <=0) to disable."
+        ),
+    )
 
     # ===== device =====
     parser.add_argument("--gpu", type=int, default=2)
@@ -130,14 +137,21 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--alpha_init", type=float, default=1.0,
-        help="Initial residual scale alpha[atlas_pos].",
-    )
-    parser.add_argument(
         "--gate_init", type=float, default=-6.0,
         help=(
             "Initial raw gate value. sigmoid(-6)≈0.0025, so the model starts "
             "close to the no-prior baseline. Use 0 for stronger initial prior."
+        ),
+    )
+    parser.add_argument(
+        "--no_prior", action="store_true", default=False,
+        help=(
+            "Ablation mode: freeze gate at a large negative value so the prior "
+            "residual is exactly 0, and skip mid CE (effectively lambda_mid=0). "
+            "Architecture is unchanged so logging and result format stay "
+            "identical, but the prior path contributes nothing and the mid "
+            "head receives no supervision. Folder name is prefixed with "
+            "'noPriorAblation' for easy separation."
         ),
     )
 
@@ -209,7 +223,6 @@ def build_model(args, device):
         mid_dim=7,
         overlap_dir=args.overlap_dir,
         temperature=args.temperature,
-        alpha_init=args.alpha_init,
         gate_init=args.gate_init,
         global_feat_dim=args.global_feat_dim,
         endpoint_dim=args.endpoint_dim,
@@ -230,8 +243,9 @@ def make_run_dir(args):
         name = safe_tag(args.run_name)
     else:
         atlas_tag = "all" if args.train_atlases == "all" else args.train_atlases.replace(",", "-")
+        prefix = "noPriorAblation" if args.no_prior else "anatomicalPriorGated"
         name = "_".join([
-            "anatomicalPriorGated",
+            prefix,
             f"model={args.model_type}",
             f"gdim={args.global_feat_dim}",
             f"edim={args.endpoint_dim}",
@@ -242,7 +256,6 @@ def make_run_dir(args):
             f"ep={args.epochs}",
             f"lambdaMid={args.lambda_mid}",
             f"temp={args.temperature}",
-            f"alpha={args.alpha_init}",
             f"gate={args.gate_init}",
             f"atlas={atlas_tag}",
             f"seed={args.seed}",
@@ -373,7 +386,7 @@ def save_curves(history, output_dir, fold=None):
     tag = "single" if fold is None else f"fold{fold}"
     epochs = [r["epoch"] for r in history]
 
-    def plot_curve(y_keys, ylabel, filename):
+    def plot_curve(y_keys, ylabel, filename, ylim=None):
         plt.figure(figsize=(8, 5))
         for key in y_keys:
             y = [r.get(key, float("nan")) for r in history]
@@ -381,6 +394,8 @@ def save_curves(history, output_dir, fold=None):
         plt.xlabel("Epoch")
         plt.ylabel(ylabel)
         plt.title(f"{ylabel} curve ({tag})")
+        if ylim is not None:
+            plt.ylim(*ylim)
         plt.legend()
         plt.tight_layout()
         plt.savefig(os.path.join(output_dir, filename), dpi=300)
@@ -391,11 +406,13 @@ def save_curves(history, output_dir, fold=None):
         ["train_swm_f1", "val_swm_f1", "train_atlas_mean_f1", "val_atlas_mean_f1"],
         "F1",
         f"convergence_f1_{tag}.png",
+        ylim=(0.9, 1.0),
     )
     plot_curve(
         ["train_atlas_mean_acc", "val_atlas_mean_acc"],
         "Accuracy",
         f"convergence_accuracy_{tag}.png",
+        ylim=(0.9, 1.0),
     )
 
 
@@ -445,15 +462,6 @@ def print_metrics_summary(metrics, label="Test", include_mid=True):
             f"f1={0.5 * (s['f1'] + e['f1']):.4f} "
             f"(start_acc={s['accuracy']:.4f}, end_acc={e['accuracy']:.4f})"
         )
-
-
-def format_alpha(alpha_dict):
-    parts = []
-    for atlas in ATLAS_LIST:
-        for pos in ["start", "end"]:
-            key = f"{atlas}_{pos}"
-            parts.append(f"{key}={alpha_dict[key]:+.3f}")
-    return ", ".join(parts)
 
 
 def format_gate(gate_dict):
@@ -694,17 +702,29 @@ def eval_one_epoch(model, loader, criterion, device, train_atlases):
 # One split / one fold
 # =====================================================
 def run_one_split(args, train_set, val_set, test_set, device, save_path, train_atlases, run_dir, fold=None):
+    # persistent_workers keeps the 64 dataloader processes alive across epochs
+    # so we don't pay the spawn cost every epoch. prefetch_factor=4 lets each
+    # worker keep a few batches queued. Both options require num_workers > 0,
+    # so we only enable them in that case.
+    loader_extra = (
+        dict(persistent_workers=True, prefetch_factor=4)
+        if args.num_workers > 0 else {}
+    )
+
     train_loader = DataLoader(
         train_set, batch_size=args.batch_size, shuffle=True,
         num_workers=args.num_workers, pin_memory=True,
+        **loader_extra,
     )
     val_loader = DataLoader(
         val_set, batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, pin_memory=True,
+        **loader_extra,
     )
     test_loader = DataLoader(
         test_set, batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, pin_memory=True,
+        **loader_extra,
     )
     print("Dataloaders ready")
 
@@ -714,9 +734,27 @@ def run_one_split(args, train_set, val_set, test_set, device, save_path, train_a
         f"  global_feat_dim={args.global_feat_dim} endpoint_dim={args.endpoint_dim} "
         f"fused_dim={model.fused_dim}"
     )
+
+    # ----- Ablation: --no_prior pins the gate to a large negative value so
+    # sigmoid(gate) ≈ 0 and the prior residual is exactly 0, and skips the
+    # mid CE. Architecture and logging are unchanged. Must happen BEFORE the
+    # optimizer is constructed so Adam sees the frozen state of the gate.
+    effective_lambda_mid = args.lambda_mid
+    if args.no_prior:
+        print(
+            "  NO PRIOR ABLATION MODE: freezing gate at -50 (sigmoid≈1.9e-22), "
+            "skipping mid CE (lambda_mid -> 0). Architecture is unchanged."
+        )
+        with torch.no_grad():
+            for k in list(model.gate.keys()):
+                model.gate[k].fill_(-50.0)
+                model.gate[k].requires_grad = False
+        effective_lambda_mid = 0.0
+
     print(
-        f"  temperature={args.temperature}  lambda_mid={args.lambda_mid}  "
-        f"alpha_init={args.alpha_init}  gate_init={args.gate_init}"
+        f"  temperature={args.temperature}  lambda_mid={effective_lambda_mid}"
+        f"{' (overridden by --no_prior)' if args.no_prior else ''}  "
+        f"gate_init={args.gate_init}"
     )
 
     param_summary = save_parameter_summary(model, run_dir)
@@ -725,8 +763,22 @@ def run_one_split(args, train_set, val_set, test_set, device, save_path, train_a
         f"trainable_params={param_summary['trainable_params']}"
     )
 
+    # Two parameter groups: gate has weight_decay=0 (a learnable scalar should
+    # not be pulled toward 0 by L2 regularization), everything else uses
+    # args.weight_decay. Frozen gate (in --no_prior mode) still lives in the
+    # optimizer; Adam skips it since requires_grad=False.
+    gate_params, other_params = [], []
+    for n, p in model.named_parameters():
+        if n.startswith("gate."):
+            gate_params.append(p)
+        else:
+            other_params.append(p)
     optimizer = torch.optim.Adam(
-        model.parameters(), lr=args.lr, weight_decay=args.weight_decay,
+        [
+            {"params": other_params, "weight_decay": args.weight_decay},
+            {"params": gate_params, "weight_decay": 0.0},
+        ],
+        lr=args.lr,
     )
     criterion = nn.CrossEntropyLoss()
 
@@ -735,6 +787,8 @@ def run_one_split(args, train_set, val_set, test_set, device, save_path, train_a
 
     best_val_loss = float("inf")
     best_epoch = -1
+    epochs_since_improvement = 0
+    early_stop_triggered = False
     history = []
     snapshot_rows = []
 
@@ -747,7 +801,7 @@ def run_one_split(args, train_set, val_set, test_set, device, save_path, train_a
         train_loss, train_metrics = train_one_epoch(
             model=model, loader=train_loader, optimizer=optimizer,
             criterion=criterion, device=device,
-            train_atlases=train_atlases, lambda_mid=args.lambda_mid,
+            train_atlases=train_atlases, lambda_mid=effective_lambda_mid,
         )
         print(f"Train Loss: {train_loss:.4f}")
         print_metrics_summary(train_metrics, label="Train")
@@ -759,11 +813,9 @@ def run_one_split(args, train_set, val_set, test_set, device, save_path, train_a
         print(f"Val Loss: {val_loss:.4f}")
         print_metrics_summary(val_metrics, label="Val")
 
-        alpha = model.alpha_snapshot()
         gate = model.gate_snapshot()
         prior_weight = model.prior_weight_snapshot()
-        print(f"  alpha: {format_alpha(alpha)}")
-        print(f"  gate(sigmoid): {format_gate(gate)}")
+        print(f"  gate(sigmoid) = effective prior weight: {format_gate(gate)}")
 
         row = {
             "fold": "single" if fold is None else fold,
@@ -792,8 +844,6 @@ def run_one_split(args, train_set, val_set, test_set, device, save_path, train_a
         history.append(row)
 
         snap = {"fold": "single" if fold is None else fold, "epoch": epoch}
-        for k, v in alpha.items():
-            snap[f"alpha_{k}"] = v
         for k, v in gate.items():
             snap[f"gate_raw_{k}"] = v["raw"]
             snap[f"gate_sigmoid_{k}"] = v["sigmoid"]
@@ -804,6 +854,7 @@ def run_one_split(args, train_set, val_set, test_set, device, save_path, train_a
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_epoch = epoch
+            epochs_since_improvement = 0
             torch.save({
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
@@ -813,20 +864,50 @@ def run_one_split(args, train_set, val_set, test_set, device, save_path, train_a
                 "param_summary": param_summary,
             }, save_path)
             print(f"Saved new best model at epoch {epoch} (Val Loss: {val_loss:.4f})")
+        else:
+            epochs_since_improvement += 1
+            if args.early_stop_patience > 0:
+                print(
+                    f"  No val_loss improvement for {epochs_since_improvement}/"
+                    f"{args.early_stop_patience} epochs "
+                    f"(best={best_val_loss:.4f} @ epoch {best_epoch})"
+                )
 
-        # Write after every epoch so interrupted runs still keep useful logs.
+        # CSVs are cheap (text append) so we still rewrite them every epoch —
+        # an interrupted run keeps useful logs. Convergence PNGs are dpi=300
+        # and not worth regenerating every epoch; we render them once at the
+        # end of training instead.
         tag = "single" if fold is None else f"fold{fold}"
         write_history_csv(history, os.path.join(run_dir, f"epoch_metrics_{tag}.csv"))
-        write_snapshot_csv(snapshot_rows, os.path.join(run_dir, f"prior_alpha_gate_{tag}.csv"))
-        save_curves(history, run_dir, fold=fold)
+        write_snapshot_csv(snapshot_rows, os.path.join(run_dir, f"prior_gate_{tag}.csv"))
 
+        # Early stop check at the end of the epoch — after CSVs are flushed.
+        if (
+            args.early_stop_patience > 0
+            and epochs_since_improvement >= args.early_stop_patience
+        ):
+            print(
+                f"\nEarly stopping at epoch {epoch}: "
+                f"val_loss did not improve for {args.early_stop_patience} "
+                f"consecutive epochs. Best={best_val_loss:.4f} @ epoch {best_epoch}."
+            )
+            early_stop_triggered = True
+            break
+
+    # Render the final convergence curves once after all epochs are done
+    # (or early-stopped).
+    save_curves(history, run_dir, fold=fold)
+
+    # `epoch` is whatever the loop variable was last set to — either args.epochs
+    # if training completed, or the early-stop epoch. Don't hardcode args.epochs.
     final_path = os.path.join(run_dir, "final_model.pth" if fold is None else f"final_model_fold{fold}.pth")
     torch.save({
-        "epoch": args.epochs,
+        "epoch": epoch,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "args": vars(args),
         "param_summary": param_summary,
+        "early_stop_triggered": early_stop_triggered,
     }, final_path)
     print(f"Saved final model to: {final_path}")
 
@@ -844,7 +925,6 @@ def run_one_split(args, train_set, val_set, test_set, device, save_path, train_a
     )
     print(f"Test Loss: {test_loss:.4f}")
     print_metrics_summary(test_metrics, label="Test")
-    print(f"  final alpha: {format_alpha(model.alpha_snapshot())}")
     print(f"  final gate(sigmoid): {format_gate(model.gate_snapshot())}")
 
     result_json = {
@@ -854,7 +934,9 @@ def run_one_split(args, train_set, val_set, test_set, device, save_path, train_a
         "test_loss": test_loss,
         "save_path": save_path,
         "final_path": final_path,
-        "alpha": model.alpha_snapshot(),
+        "last_epoch": epoch,
+        "early_stop_triggered": early_stop_triggered,
+        "early_stop_patience": args.early_stop_patience,
         "gate": model.gate_snapshot(),
         "effective_prior_weight": model.prior_weight_snapshot(),
         "param_summary": param_summary,
@@ -868,7 +950,6 @@ def run_one_split(args, train_set, val_set, test_set, device, save_path, train_a
         "test_loss": test_loss,
         "test_metrics": test_metrics,
         "save_path": save_path,
-        "alpha": model.alpha_snapshot(),
         "gate": model.gate_snapshot(),
         "effective_prior_weight": model.prior_weight_snapshot(),
     }
@@ -961,7 +1042,6 @@ def main():
                 "best_val_loss": r["best_val_loss"],
                 "test_loss": r["test_loss"],
                 "save_path": r["save_path"],
-                "alpha": r["alpha"],
                 "gate": r["gate"],
                 "effective_prior_weight": r["effective_prior_weight"],
             }
