@@ -47,6 +47,7 @@ class UnifiedSWMNet(nn.Module):
         global_feat_dim=1024,
         endpoint_dim=256,
         swm_hidden_dim=256,
+        use_endpoint=True,
         eps=1e-8,
     ):
         super().__init__()
@@ -54,6 +55,7 @@ class UnifiedSWMNet(nn.Module):
         self.global_dim = int(global_feat_dim)
         self.endpoint_dim = int(endpoint_dim)
         self.swm_hidden_dim = int(swm_hidden_dim)
+        self.use_endpoint = bool(use_endpoint)
 
         # ========= 1) backbone =========
         backbone = backbone.lower()
@@ -68,15 +70,25 @@ class UnifiedSWMNet(nn.Module):
         else:
             raise ValueError(f"Unknown backbone: {backbone}")
 
-        # ========= 2) endpoint MLP =========
-        self.endpoint_mlp = nn.Sequential(
-            nn.Linear(3, 64),
-            nn.ReLU(),
-            nn.Linear(64, 128),
-            nn.ReLU(),
-            nn.Linear(128, self.endpoint_dim),
-        )
-        self.fused_dim = self.global_dim + 2 * self.endpoint_dim
+        # ========= 2) optional endpoint MLP =========
+        # use_endpoint=True:  z = [streamline_global, start_endpoint, end_endpoint]
+        # use_endpoint=False: z = streamline_global only
+        #
+        # This makes the no-endpoint baseline parameter-clean: when endpoint
+        # features are disabled, endpoint_mlp is not instantiated and all heads
+        # are built on top of global_feat_dim instead of global_feat_dim+2*endpoint_dim.
+        if self.use_endpoint:
+            self.endpoint_mlp = nn.Sequential(
+                nn.Linear(3, 64),
+                nn.ReLU(),
+                nn.Linear(64, 128),
+                nn.ReLU(),
+                nn.Linear(128, self.endpoint_dim),
+            )
+            self.fused_dim = self.global_dim + 2 * self.endpoint_dim
+        else:
+            self.endpoint_mlp = None
+            self.fused_dim = self.global_dim
 
         # ========= 3) SWM / non-SWM binary head =========
         self.swm_head = nn.Sequential(
@@ -155,12 +167,14 @@ class UnifiedSWMNet(nn.Module):
         """
         global_feat = self.pointnet(fiber)                  # (B, global_dim)
 
-        start = fiber[:, :, 0]                              # (B, 3)
-        end = fiber[:, :, -1]                               # (B, 3)
-        start_feat = self.endpoint_mlp(start)               # (B, endpoint_dim)
-        end_feat = self.endpoint_mlp(end)                   # (B, endpoint_dim)
-
-        z = torch.cat([global_feat, start_feat, end_feat], dim=1)
+        if self.use_endpoint:
+            start = fiber[:, :, 0]                          # (B, 3)
+            end = fiber[:, :, -1]                           # (B, 3)
+            start_feat = self.endpoint_mlp(start)           # (B, endpoint_dim)
+            end_feat = self.endpoint_mlp(end)               # (B, endpoint_dim)
+            z = torch.cat([global_feat, start_feat, end_feat], dim=1)
+        else:
+            z = global_feat                                 # (B, global_dim)
 
         swm_logits = self.swm_head(z)
         mid_start_logits = self.mid_head_start(z)

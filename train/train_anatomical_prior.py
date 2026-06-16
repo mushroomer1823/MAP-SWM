@@ -106,7 +106,17 @@ def parse_args():
     )
     parser.add_argument(
         "--endpoint_dim", type=int, default=256,
-        help="Endpoint feature dimension after endpoint_mlp.",
+        help="Endpoint feature dimension after endpoint_mlp. Ignored when --no-use_endpoint is set.",
+    )
+    parser.add_argument(
+        "--use_endpoint",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Whether to concatenate start/end endpoint features with the "
+            "streamline backbone feature. Use --no-use_endpoint for the "
+            "streamline-only baseline without endpoint features."
+        ),
     )
     parser.add_argument(
         "--swm_hidden_dim", type=int, default=256,
@@ -227,6 +237,7 @@ def build_model(args, device):
         global_feat_dim=args.global_feat_dim,
         endpoint_dim=args.endpoint_dim,
         swm_hidden_dim=args.swm_hidden_dim,
+        use_endpoint=args.use_endpoint,
     ).to(device)
     return model
 
@@ -244,8 +255,10 @@ def make_run_dir(args):
     else:
         atlas_tag = "all" if args.train_atlases == "all" else args.train_atlases.replace(",", "-")
         prefix = "noPriorAblation" if args.no_prior else "anatomicalPriorGated"
+        endpoint_tag = "withEndpoint" if args.use_endpoint else "streamlineOnly_noEndpoint"
         name = "_".join([
             prefix,
+            endpoint_tag,
             f"model={args.model_type}",
             f"gdim={args.global_feat_dim}",
             f"edim={args.endpoint_dim}",
@@ -731,7 +744,8 @@ def run_one_split(args, train_set, val_set, test_set, device, save_path, train_a
     model = build_model(args, device)
     print("Model initialized (gated-residual anatomical prior)")
     print(
-        f"  global_feat_dim={args.global_feat_dim} endpoint_dim={args.endpoint_dim} "
+        f"  use_endpoint={args.use_endpoint} "
+        f"global_feat_dim={args.global_feat_dim} endpoint_dim={args.endpoint_dim} "
         f"fused_dim={model.fused_dim}"
     )
 
