@@ -25,6 +25,15 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from sklearn.metrics import precision_recall_fscore_support
 
+# Avoid "OSError: [Errno 24] too many open files" when running k-fold with
+# many DataLoader workers. PyTorch's default tensor-sharing strategy
+# ('file_descriptor') opens one fd per shared tensor; with num_workers=64,
+# prefetch_factor=4, and 3 simultaneously-alive loaders (train/val/test),
+# the fd count blows past the default ulimit (1024). Switching to
+# 'file_system' uses /dev/shm-backed tmpfs files instead — minor IPC slowdown,
+# but no fd explosion. Must be set BEFORE any DataLoader spawns workers.
+torch.multiprocessing.set_sharing_strategy("file_system")
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
