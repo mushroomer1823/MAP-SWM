@@ -45,8 +45,10 @@ from models.model_anatomical_prior import UnifiedSWMNet  # noqa: E402
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Train UnifiedSWMNet with gated-residual anatomical-prior conditioning "
-            "(yeo mid + fixed overlap matrices M)."
+            "Train UnifiedSWMNet with gated-residual anatomical-prior conditioning. "
+            "Mid layer can be yeo (7 networks) or lobe (14 hemi-lobes) via --mid_layer; "
+            "the corresponding M_{mid_layer}_to_{atlas}.npy overlap matrices are loaded "
+            "from {overlap_dir}/{mid_layer}/."
         )
     )
 
@@ -131,13 +133,28 @@ def parse_args():
 
     # ===== anatomical-prior specific =====
     parser.add_argument(
+        "--mid_layer", type=str, default="yeo",
+        choices=["yeo", "lobe"],
+        help=(
+            "Source of the mid-layer prior. 'yeo' uses 7 yeo-network labels "
+            "from atlas_targets and M_yeo_to_{atlas}.npy under "
+            "{overlap_dir}/yeo/. 'lobe' uses 14 hemisphere-lobe labels from "
+            "lobe_targets and M_lobe_to_{atlas}.npy under {overlap_dir}/lobe/. "
+            "mid_dim is set automatically: yeo->7, lobe->14."
+        ),
+    )
+    parser.add_argument(
         "--overlap_dir", type=str,
-        default="/home/hyf/swm_identification/multi-atlas-swm/atlas_overlap",
-        help="Directory holding M_yeo_to_{atlas}.npy.",
+        default="/home/heyifei/codes/test/atlas_overlap",
+        help=(
+            "Parent directory holding the per-source overlap subfolders "
+            "{yeo,lobe}/. The actual matrix path is "
+            "{overlap_dir}/{mid_layer}/M_{mid_layer}_to_{atlas}.npy."
+        ),
     )
     parser.add_argument(
         "--lambda_mid", type=float, default=1.0,
-        help="Weight on the yeo CE that supervises mid_head_start/end.",
+        help="Weight on the mid CE that supervises mid_head_start/end.",
     )
     parser.add_argument(
         "--temperature", type=float, default=1.0,
@@ -222,16 +239,26 @@ def compute_classification_metrics(pred_list, label_list, average="macro"):
     return {"accuracy": acc, "precision": precision, "recall": recall, "f1": f1}
 
 
+MID_DIMS = {"yeo": 7, "lobe": 14}
+
+
+def resolve_overlap_dir(args):
+    """Auto-route --overlap_dir to the {mid_layer}/ subfolder."""
+    return os.path.join(args.overlap_dir, args.mid_layer)
+
+
 def build_model(args, device):
     atlas_roi_dims = {
         "yeo": 7, "DK": 70, "Brainnetome": 246,
         "AAL": 116, "schaefer_100": 100, "Destrieux": 75,
     }
+    mid_dim = MID_DIMS[args.mid_layer]
     model = UnifiedSWMNet(
         atlas_roi_dims=atlas_roi_dims,
         backbone=args.model_type,
-        mid_dim=7,
-        overlap_dir=args.overlap_dir,
+        mid_dim=mid_dim,
+        mid_source=args.mid_layer,
+        overlap_dir=resolve_overlap_dir(args),
         temperature=args.temperature,
         gate_init=args.gate_init,
         global_feat_dim=args.global_feat_dim,
@@ -240,6 +267,19 @@ def build_model(args, device):
         use_endpoint=args.use_endpoint,
     ).to(device)
     return model
+
+
+def _mid_label_source(mid_layer, pos, atlas_targets, lobe_targets):
+    """Look up the per-position mid supervision label tensor.
+
+    mid_layer == 'yeo'  -> atlas_targets['yeo_{pos}']   (7 classes)
+    mid_layer == 'lobe' -> lobe_targets['lobe_{pos}']   (14 classes)
+    """
+    if mid_layer == "yeo":
+        return atlas_targets[f"yeo_{pos}"]
+    if mid_layer == "lobe":
+        return lobe_targets[f"lobe_{pos}"]
+    raise ValueError(f"Unknown mid_layer: {mid_layer}")
 
 
 def safe_tag(x):
@@ -258,6 +298,7 @@ def make_run_dir(args):
         endpoint_tag = "withEndpoint" if args.use_endpoint else "streamlineOnly_noEndpoint"
         name = "_".join([
             prefix,
+            f"mid={args.mid_layer}",
             endpoint_tag,
             f"model={args.model_type}",
             f"gdim={args.global_feat_dim}",
@@ -445,8 +486,11 @@ def write_snapshot_csv(snapshot_rows, path):
             writer.writerow(r)
 
 
-def print_metrics_summary(metrics, label="Test", include_mid=True):
-    """SWM binary + per-atlas mean(start, end) metrics, with optional mid_yeo row."""
+def print_metrics_summary(metrics, label="Test", include_mid=True, mid_label="mid_yeo"):
+    """SWM binary + per-atlas mean(start, end) metrics, with optional mid row.
+
+    mid_label is the display name for the mid row (e.g. 'mid_yeo' or 'mid_lobe').
+    """
     swm = metrics.get("swm")
     if swm is not None:
         print(
@@ -457,7 +501,7 @@ def print_metrics_summary(metrics, label="Test", include_mid=True):
 
     rows = [(atlas, atlas) for atlas in ATLAS_LIST]
     if include_mid:
-        rows.append(("mid_yeo", "mid"))
+        rows.append((mid_label, "mid"))
 
     print(f"  {label} per-atlas mean(start, end):")
     for display, prefix in rows:
@@ -487,11 +531,11 @@ def format_gate(gate_dict):
     return ", ".join(parts)
 
 
-def metrics_to_csv_rows(metrics, fold=None, split="test", include_mid=True):
+def metrics_to_csv_rows(metrics, fold=None, split="test", include_mid=True, mid_label="mid_yeo"):
     fold_str = "single" if fold is None else f"fold{fold}"
     pairs = [(atlas, atlas) for atlas in ATLAS_LIST]
     if include_mid:
-        pairs.append(("mid_yeo", "mid"))
+        pairs.append((mid_label, "mid"))
 
     rows = []
     swm = metrics.get("swm")
@@ -565,7 +609,7 @@ def summarize_kfold_results(fold_results):
 # =====================================================
 # Train / Eval
 # =====================================================
-def train_one_epoch(model, loader, optimizer, criterion, device, train_atlases, lambda_mid):
+def train_one_epoch(model, loader, optimizer, criterion, device, train_atlases, lambda_mid, mid_layer):
     model.train()
     total_loss = 0.0
     total_samples = 0
@@ -579,6 +623,7 @@ def train_one_epoch(model, loader, optimizer, criterion, device, train_atlases, 
     for X, atlas_targets, lobe_targets, _ in loader:
         X = X.to(device, non_blocking=True)
         atlas_targets = {k: v.to(device, non_blocking=True) for k, v in atlas_targets.items()}
+        lobe_targets = {k: v.to(device, non_blocking=True) for k, v in lobe_targets.items()}
 
         optimizer.zero_grad()
         outputs = model(X)
@@ -590,15 +635,15 @@ def train_one_epoch(model, loader, optimizer, criterion, device, train_atlases, 
         all_swm_labels.append(atlas_targets["swm"].cpu())
 
         if swm_mask.sum().item() > 0:
-            # ----- mid CE: supervise mid heads with yeo labels -----
+            # ----- mid CE: supervise mid heads with yeo or lobe labels -----
             for pos in ["start", "end"]:
-                mid_label = atlas_targets[f"yeo_{pos}"]
+                mid_target = _mid_label_source(mid_layer, pos, atlas_targets, lobe_targets)
                 batch_loss += lambda_mid * criterion(
-                    outputs[f"mid_{pos}"][swm_mask], mid_label[swm_mask],
+                    outputs[f"mid_{pos}"][swm_mask], mid_target[swm_mask],
                 )
                 preds = outputs[f"mid_{pos}"][swm_mask].argmax(dim=1)
                 all_mid_preds[pos].append(preds.cpu())
-                all_mid_labels[pos].append(mid_label[swm_mask].cpu())
+                all_mid_labels[pos].append(mid_target[swm_mask].cpu())
 
             # ----- atlas CE: only train_atlases for backprop, all for metric -----
             for atlas in train_atlases:
@@ -642,7 +687,7 @@ def train_one_epoch(model, loader, optimizer, criterion, device, train_atlases, 
 
 
 @torch.no_grad()
-def eval_one_epoch(model, loader, criterion, device, train_atlases):
+def eval_one_epoch(model, loader, criterion, device, train_atlases, mid_layer):
     model.eval()
     total_loss = 0.0
     total_samples = 0
@@ -656,6 +701,7 @@ def eval_one_epoch(model, loader, criterion, device, train_atlases):
     for X, atlas_targets, lobe_targets, _ in loader:
         X = X.to(device, non_blocking=True)
         atlas_targets = {k: v.to(device, non_blocking=True) for k, v in atlas_targets.items()}
+        lobe_targets = {k: v.to(device, non_blocking=True) for k, v in lobe_targets.items()}
 
         outputs = model(X)
         swm_mask = atlas_targets["swm"] == 1
@@ -669,10 +715,10 @@ def eval_one_epoch(model, loader, criterion, device, train_atlases):
 
         if swm_mask.sum().item() > 0:
             for pos in ["start", "end"]:
-                mid_label = atlas_targets[f"yeo_{pos}"]
+                mid_target = _mid_label_source(mid_layer, pos, atlas_targets, lobe_targets)
                 preds = outputs[f"mid_{pos}"][swm_mask].argmax(dim=1)
                 all_mid_preds[pos].append(preds.cpu())
-                all_mid_labels[pos].append(mid_label[swm_mask].cpu())
+                all_mid_labels[pos].append(mid_target[swm_mask].cpu())
 
             for atlas in train_atlases:
                 for pos in ["start", "end"]:
@@ -816,16 +862,18 @@ def run_one_split(args, train_set, val_set, test_set, device, save_path, train_a
             model=model, loader=train_loader, optimizer=optimizer,
             criterion=criterion, device=device,
             train_atlases=train_atlases, lambda_mid=effective_lambda_mid,
+            mid_layer=args.mid_layer,
         )
         print(f"Train Loss: {train_loss:.4f}")
-        print_metrics_summary(train_metrics, label="Train")
+        print_metrics_summary(train_metrics, label="Train", mid_label=f"mid_{args.mid_layer}")
 
         val_loss, val_metrics = eval_one_epoch(
             model=model, loader=val_loader, criterion=criterion,
             device=device, train_atlases=train_atlases,
+            mid_layer=args.mid_layer,
         )
         print(f"Val Loss: {val_loss:.4f}")
-        print_metrics_summary(val_metrics, label="Val")
+        print_metrics_summary(val_metrics, label="Val", mid_label=f"mid_{args.mid_layer}")
 
         gate = model.gate_snapshot()
         prior_weight = model.prior_weight_snapshot()
@@ -936,9 +984,10 @@ def run_one_split(args, train_set, val_set, test_set, device, save_path, train_a
     test_loss, test_metrics = eval_one_epoch(
         model=model, loader=test_loader, criterion=criterion,
         device=device, train_atlases=train_atlases,
+        mid_layer=args.mid_layer,
     )
     print(f"Test Loss: {test_loss:.4f}")
-    print_metrics_summary(test_metrics, label="Test")
+    print_metrics_summary(test_metrics, label="Test", mid_label=f"mid_{args.mid_layer}")
     print(f"  final gate(sigmoid): {format_gate(model.gate_snapshot())}")
 
     result_json = {
@@ -984,7 +1033,11 @@ def main():
     )
     print("Using device:", device)
     print(f"Using model type: {args.model_type}")
-    print(f"Overlap dir: {args.overlap_dir}")
+    print(
+        f"Mid layer: {args.mid_layer} "
+        f"(mid_dim={MID_DIMS[args.mid_layer]}, "
+        f"overlap matrices loaded from {resolve_overlap_dir(args)})"
+    )
 
     train_atlases = parse_train_atlases(args)
     print("Atlases used for training loss:", train_atlases)
@@ -1008,7 +1061,7 @@ def main():
             train_atlases=train_atlases, run_dir=run_dir, fold=None,
         )
 
-        rows = metrics_to_csv_rows(result["test_metrics"], fold=None, split="test")
+        rows = metrics_to_csv_rows(result["test_metrics"], fold=None, split="test", mid_label=f"mid_{args.mid_layer}")
         write_metrics_csv(rows, os.path.join(run_dir, "test_metrics.csv"))
         print(f"All outputs saved under: {run_dir}")
         return
@@ -1046,7 +1099,7 @@ def main():
 
     all_rows = []
     for r in fold_results:
-        all_rows.extend(metrics_to_csv_rows(r["test_metrics"], fold=r["fold"], split="test"))
+        all_rows.extend(metrics_to_csv_rows(r["test_metrics"], fold=r["fold"], split="test", mid_label=f"mid_{args.mid_layer}"))
     write_metrics_csv(all_rows, os.path.join(run_dir, "test_metrics_all_folds.csv"))
     save_json({
         "fold_results": [

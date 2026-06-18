@@ -13,12 +13,15 @@
 # anatomical prior is unhelpful for a given atlas/position head, the learnable
 # gate drifts negative and the model degenerates to the no-prior baseline.
 #
-# M[A] is a fixed (mid_dim, n_roi_A) matrix of P(atlas_roi | yeo_class),
-# computed offline from voxel overlap on a common cortical region.
+# M[A] is a fixed (mid_dim, n_roi_A) matrix of P(atlas_roi | mid_class),
+# computed offline from voxel overlap on a common cortical region. The mid
+# source can be either yeo (7 networks) or lobe (14 hemisphere-lobes); the
+# trainer selects which via --mid_layer and the model loads
+# M_{mid_source}_to_{atlas}.npy accordingly.
 #
 # mid_*_logits are detached when forming the prior so:
 #   - atlas CE never flows back into mid_head or the backbone via the prior
-#   - mid_head is supervised purely by its own CE (yeo label)
+#   - mid_head is supervised purely by its own CE (yeo or lobe label)
 #   - backbone still receives gradients from SWM + atlas CEs through the direct
 #     base_head path.
 
@@ -41,6 +44,7 @@ class UnifiedSWMNet(nn.Module):
         atlas_roi_dims,
         backbone,
         mid_dim=7,
+        mid_source="yeo",
         overlap_dir="/home/heyifei/codes/test/atlas_overlap",
         temperature=1.0,
         gate_init=-6.0,
@@ -56,6 +60,7 @@ class UnifiedSWMNet(nn.Module):
         self.endpoint_dim = int(endpoint_dim)
         self.swm_hidden_dim = int(swm_hidden_dim)
         self.use_endpoint = bool(use_endpoint)
+        self.mid_source = str(mid_source)
 
         # ========= 1) backbone =========
         backbone = backbone.lower()
@@ -97,7 +102,7 @@ class UnifiedSWMNet(nn.Module):
             nn.Linear(self.swm_hidden_dim, 2),
         )
 
-        # ========= 4) mid (yeo) heads — independent for start / end =========
+        # ========= 4) mid (yeo or lobe) heads — independent for start / end =====
         self.mid_dim = mid_dim
         self.mid_head_start = nn.Linear(self.fused_dim, mid_dim)
         self.mid_head_end = nn.Linear(self.fused_dim, mid_dim)
@@ -122,15 +127,17 @@ class UnifiedSWMNet(nn.Module):
         })
 
         # ========= 7) anatomical overlap matrices M (fixed buffers) ==========
-        # M[A]: (mid_dim, n_roi_A); each row is P(atlas_roi | yeo_class)
+        # M[A]: (mid_dim, n_roi_A); each row is P(atlas_roi | mid_class)
         # estimated by voxel overlap on a common cortical region. Registered
         # as buffer so it moves with .to(device) and is included in state_dict.
+        # File name pattern follows the mid source so yeo / lobe variants do
+        # not collide: M_yeo_to_{atlas}.npy vs M_lobe_to_{atlas}.npy.
         for atlas, n_roi in atlas_roi_dims.items():
-            path = os.path.join(overlap_dir, f"M_yeo_to_{atlas}.npy")
+            path = os.path.join(overlap_dir, f"M_{self.mid_source}_to_{atlas}.npy")
             if not os.path.exists(path):
                 raise FileNotFoundError(
                     f"Overlap matrix not found: {path}. "
-                    f"Run atlas_overlap/compute_overlap.py first."
+                    f"Run atlas_overlap/compute_overlap.py --source {self.mid_source} first."
                 )
             M = np.load(path)
             if M.shape != (mid_dim, n_roi):
@@ -147,7 +154,8 @@ class UnifiedSWMNet(nn.Module):
     def _prior_log_probs(self, mid_logits, atlas):
         """
         log P_prior(atlas_roi | mid prediction, anatomy) for one
-        (mid head output, atlas) pair.
+        (mid head output, atlas) pair. The mid head's classes are whatever
+        the configured mid_source is (yeo: 7 networks, lobe: 14 hemi-lobes).
 
         mid_logits is detached so atlas CE does not pollute mid_head or
         backbone through this path.
