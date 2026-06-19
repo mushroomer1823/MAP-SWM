@@ -12,6 +12,7 @@
 
 import argparse
 import csv
+import gc
 import json
 import os
 import re
@@ -97,6 +98,12 @@ def parse_args():
     parser.add_argument("--weight_decay", type=float, default=1e-5)
     parser.add_argument("--num_workers", type=int, default=64)
     parser.add_argument(
+        "--prefetch_factor", type=int, default=4,
+        help="Number of batches prefetched per worker. Lower values reduce "
+        "shared-memory pressure (relevant for k-fold with many workers). "
+        "Default 4; set to 2 if you hit 'Shared memory manager timeout'.",
+    )
+    parser.add_argument(
         "--early_stop_patience", type=int, default=10,
         help=(
             "Stop training if val_loss does not improve for this many "
@@ -156,7 +163,7 @@ def parse_args():
     )
     parser.add_argument(
         "--overlap_dir", type=str,
-        default="/home/heyifei/codes/test/atlas_overlap",
+        default="/home/hyf/swm_identification/multi-atlas-swm/atlas_overlap",
         help=(
             "Parent directory holding the per-source overlap subfolders "
             "{yeo,lobe}/. The actual matrix path is "
@@ -1080,6 +1087,41 @@ def eval_one_epoch(model, loader, criterion, device, train_atlases, mid_layer,
     return avg_loss, metrics, raw
 
 
+def _shutdown_dataloader(loader):
+    """Explicitly shut down a DataLoader with persistent workers.
+
+    Deleting the loader object is not always enough — persistent workers may
+    outlive the Python object and hold shared-memory references. This helper
+    forces worker termination and then waits for the pin_memory thread to drain.
+    """
+    if loader is None:
+        return
+
+    # _iterator holds the current epoch's worker management state.
+    # Deleting it signals workers to shut down (they check _rcvd_idx vs
+    # _send_idx in their main loop).
+    if hasattr(loader, "_iterator") and loader._iterator is not None:
+        del loader._iterator
+
+    # Some PyTorch versions expose _shutdown_workers; call it when available.
+    if hasattr(loader, "_shutdown_workers"):
+        loader._shutdown_workers()
+
+    # If pin_memory is enabled, wait for the pin_memory thread to finish
+    # processing any remaining data in its in/out queues.
+    if hasattr(loader, "pin_memory") and loader.pin_memory:
+        if hasattr(loader, "_pin_memory_thread") and loader._pin_memory_thread is not None:
+            loader._pin_memory_thread.join(timeout=5.0)
+
+
+def _shutdown_dataloaders(*loaders):
+    for ld in loaders:
+        try:
+            _shutdown_dataloader(ld)
+        except Exception:
+            pass
+
+
 def _batch_subject_list(subject_ids):
     """Normalize DataLoader's collated subject_ids into a plain list of strings.
 
@@ -1144,7 +1186,7 @@ def run_one_split(args, train_set, val_set, test_set, device, save_path, train_a
     # worker keep a few batches queued. Both options require num_workers > 0,
     # so we only enable them in that case.
     loader_extra = (
-        dict(persistent_workers=True, prefetch_factor=4)
+        dict(persistent_workers=True, prefetch_factor=args.prefetch_factor)
         if args.num_workers > 0 else {}
     )
 
@@ -1426,6 +1468,12 @@ def run_one_split(args, train_set, val_set, test_set, device, save_path, train_a
     }
     save_json(result_json, os.path.join(run_dir, "result_summary.json" if fold is None else f"result_summary_fold{fold}.json"))
 
+    # Explicitly shut down all DataLoaders so persistent workers release
+    # shared-memory resources before the next fold starts.
+    _shutdown_dataloaders(train_loader, val_loader, test_loader)
+    del train_loader, val_loader, test_loader
+    gc.collect()
+
     return {
         "fold": fold,
         "best_epoch": best_epoch,
@@ -1549,6 +1597,11 @@ def _run_training(args, run_dir, device, train_atlases):
             fold=fold,
         )
         fold_results.append(result)
+
+        # Between folds: give the OS a brief window to reclaim shared-memory
+        # segments and file handles released by the previous fold's workers.
+        gc.collect()
+        time.sleep(2.0)
 
     summarize_kfold_results(fold_results)
 
