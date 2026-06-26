@@ -87,7 +87,6 @@ Key parameters:
 |---|---|
 | `--model_type` | Backbone: `pointnet`, `pointnet++`, `dgcnn`, `pointmlp` |
 | `--mid_layer` | Mid-layer source: `yeo` (7 classes) or `lobe` (14 classes) |
-| `--use_endpoint` | Whether to include start/end point features |
 | `--k_fold` | K for cross-validation (≤1 uses single split) |
 | `--group_by_subject` | Keep all fibers of a subject in the same split |
 | `--no_prior` | Ablation: freeze gate to 0, disabling the anatomical prior |
@@ -152,3 +151,46 @@ atlas_logits = base_head(z) + sigmoid(gate) × log( softmax(mid_logits/τ) @ M )
 | AAL | 116 | Automated Anatomical Labeling |
 | Schaefer 100 | 100 | Functional parcellation (100 parcels) |
 | Destrieux | 75 | Sulcal/gyral anatomical parcellation |
+
+## Light Anatomical Bottleneck version
+
+This version adds a deployable lightweight hierarchical model for multi-atlas SWM classification.
+The recommended configuration is:
+
+```bash
+python train/train_anatomical_prior.py \
+  --model_type pointnet \
+  --model_scale light \
+  --endpoint_usage mid_only \
+  --mid_layer lobe \
+  --prior_mode adapter \
+  --classifier_head prototype \
+  --lambda_mid 0.3 \
+  --gate_init 0 \
+  --temperature 1.5
+```
+
+Key switches:
+
+- `--endpoint_usage all`: original-style setting; endpoint features enter final atlas heads directly.
+- `--endpoint_usage mid_only`: endpoint features only predict the intermediate anatomical layer; final atlas heads receive streamline global feature + compact mid-layer bottleneck.
+- `--endpoint_usage none`: no endpoint encoder.
+- `--classifier_head prototype`: replaces large linear final atlas classifiers with compact cosine prototype classifiers.
+- `--prior_mode adapter`: uses a learnable adapter from mid probability + overlap prior to residual atlas logits.
+- `--model_scale full/light/tiny`: presets for feature dimensions.
+
+Recommended ablations:
+
+```bash
+# Strong full baseline
+python train/train_anatomical_prior.py --model_scale full --endpoint_usage all --classifier_head linear --no_prior
+
+# Lightweight bottleneck with prior adapter and prototype heads
+python train/train_anatomical_prior.py --model_scale light --endpoint_usage mid_only --classifier_head prototype --prior_mode adapter
+
+# Clean bottleneck ablation: endpoint cannot affect final heads because the prior/mid bottleneck is disabled
+python train/train_anatomical_prior.py --model_scale light --endpoint_usage mid_only --classifier_head prototype --no_prior
+
+# Tiny deployable version
+python train/train_anatomical_prior.py --model_scale tiny --endpoint_usage mid_only --classifier_head prototype --prior_mode adapter
+```

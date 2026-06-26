@@ -1,31 +1,22 @@
 # model_anatomical_prior.py
 #
-# SWM classifier with anatomical-prior conditioning.
+# Unified SWM multi-atlas classifier with a Light Anatomical Bottleneck option.
 #
-# Single-parameter gated residual: each (atlas, pos) head learns one scalar
-# `gate` whose sigmoid is the prior's effective weight in [0, 1].
+# Recommended lightweight configuration:
+#   endpoint_usage="mid_only"
+#   classifier_head="prototype"
+#   prior_mode="adapter"
 #
-#     atlas_logits[A, pos] = base_head[A, pos](z)
-#                          + sigmoid(gate[A, pos])
-#                            * log( softmax(mid_pos_logits / tau) @ M[A] )
-#
-# The direct streamline + endpoint path is therefore always preserved. If the
-# anatomical prior is unhelpful for a given atlas/position head, the learnable
-# gate drifts negative and the model degenerates to the no-prior baseline.
-#
-# M[A] is a fixed (mid_dim, n_roi_A) matrix of P(atlas_roi | mid_class),
-# computed offline from voxel overlap on a common cortical region. The mid
-# source can be either yeo (7 networks) or lobe (14 hemisphere-lobes); the
-# trainer selects which via --mid_layer and the model loads
-# M_{mid_source}_to_{atlas}.npy accordingly.
-#
-# mid_*_logits are detached when forming the prior so:
-#   - atlas CE never flows back into mid_head or the backbone via the prior
-#   - mid_head is supervised purely by its own CE (yeo or lobe label)
-#   - backbone still receives gradients from SWM + atlas CEs through the direct
-#     base_head path.
+# In this setting, endpoint features are used only to predict the intermediate
+# anatomical labels (Yeo or lobe). The final multi-atlas heads do not directly
+# consume endpoint features. Instead, the final heads receive:
+#   1) the streamline global feature, and
+#   2) a compact mid-layer anatomical embedding derived from mid probabilities.
+# A small learnable prior adapter then produces a residual logit correction from
+# the mid prediction and the fixed anatomical overlap matrix.
 
 import os
+from typing import Dict
 
 import numpy as np
 import torch
@@ -38,29 +29,133 @@ from networks.DGCNN import DGCNNEncoder
 from networks.pointMLP import PointMLPEncoder
 
 
+class PrototypeClassifier(nn.Module):
+    """Compact cosine prototype classifier.
+
+    It replaces a large Linear(in_dim, num_classes) head with:
+        feature projection: in_dim -> proto_dim
+        class prototypes:   num_classes x proto_dim
+        cosine similarity in prototype space
+
+    This is useful for lightweight multi-class classification because the
+    parameter cost scales with (in_dim + num_classes) * proto_dim instead of
+    in_dim * num_classes.
+    """
+
+    def __init__(self, in_dim: int, num_classes: int, proto_dim: int = 128,
+                 dropout: float = 0.1, scale: float = 16.0):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.LayerNorm(in_dim),
+            nn.Dropout(dropout),
+            nn.Linear(in_dim, proto_dim),
+            nn.GELU(),
+            nn.LayerNorm(proto_dim),
+        )
+        self.prototypes = nn.Parameter(torch.empty(num_classes, proto_dim))
+        nn.init.xavier_uniform_(self.prototypes)
+        self.log_scale = nn.Parameter(torch.log(torch.tensor(float(scale))))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        z = self.proj(x)
+        z = F.normalize(z, dim=-1)
+        p = F.normalize(self.prototypes, dim=-1)
+        # clamp scale for stability; exp(log_scale) remains trainable.
+        scale = torch.exp(self.log_scale).clamp(1.0, 100.0)
+        return scale * F.linear(z, p)
+
+
+class CosineClassifier(nn.Module):
+    """Cosine classifier with the same order of parameters as Linear."""
+
+    def __init__(self, in_dim: int, num_classes: int, scale: float = 16.0):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(num_classes, in_dim))
+        nn.init.xavier_uniform_(self.weight)
+        self.log_scale = nn.Parameter(torch.log(torch.tensor(float(scale))))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.normalize(x, dim=-1)
+        w = F.normalize(self.weight, dim=-1)
+        scale = torch.exp(self.log_scale).clamp(1.0, 100.0)
+        return scale * F.linear(x, w)
+
+
+class PriorAdapter(nn.Module):
+    """Learnable anatomical prior adapter.
+
+    Input:  concat(mid_prob, log_overlap_prior)
+    Output: residual delta logits for one atlas endpoint head.
+    """
+
+    def __init__(self, mid_dim: int, n_roi: int, hidden_dim: int = 64,
+                 dropout: float = 0.1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(mid_dim + n_roi),
+            nn.Dropout(dropout),
+            nn.Linear(mid_dim + n_roi, hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, n_roi),
+        )
+        # Start as a very small residual correction. The gate controls magnitude,
+        # but this makes early training even safer.
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, mid_prob: torch.Tensor, log_prior: torch.Tensor) -> torch.Tensor:
+        return self.net(torch.cat([mid_prob, log_prior], dim=-1))
+
+
 class UnifiedSWMNet(nn.Module):
     def __init__(
         self,
-        atlas_roi_dims,
-        backbone,
-        mid_dim=7,
-        mid_source="yeo",
-        overlap_dir="/home/heyifei/codes/test/atlas_overlap",
-        temperature=1.0,
-        gate_init=-6.0,
-        global_feat_dim=1024,
-        endpoint_dim=256,
-        swm_hidden_dim=256,
-        use_endpoint=True,
-        eps=1e-8,
+        atlas_roi_dims: Dict[str, int],
+        backbone: str,
+        mid_dim: int = 7,
+        mid_source: str = "yeo",
+        overlap_dir: str = "/home/heyifei/codes/test/atlas_overlap",
+        temperature: float = 1.0,
+        gate_init: float = 0.0,
+        global_feat_dim: int = 512,
+        endpoint_dim: int = 64,
+        swm_hidden_dim: int = 256,
+        endpoint_usage: str = "mid_only",
+        mid_embed_dim: int = 64,
+        classifier_head: str = "prototype",
+        proto_dim: int = 128,
+        head_dropout: float = 0.1,
+        prior_mode: str = "adapter",
+        prior_hidden_dim: int = 64,
+        prior_dropout: float = 0.1,
+        detach_prior: bool = False,
+        eps: float = 1e-8,
     ):
         super().__init__()
 
+        endpoint_usage = endpoint_usage.lower()
+        if endpoint_usage not in {"all", "mid_only", "none"}:
+            raise ValueError("endpoint_usage must be one of: all, mid_only, none")
+        classifier_head = classifier_head.lower()
+        if classifier_head not in {"linear", "cosine", "prototype"}:
+            raise ValueError("classifier_head must be one of: linear, cosine, prototype")
+        prior_mode = prior_mode.lower()
+        if prior_mode not in {"none", "overlap_log", "adapter", "hybrid"}:
+            raise ValueError("prior_mode must be one of: none, overlap_log, adapter, hybrid")
+
+        self.atlas_roi_dims = dict(atlas_roi_dims)
         self.global_dim = int(global_feat_dim)
         self.endpoint_dim = int(endpoint_dim)
         self.swm_hidden_dim = int(swm_hidden_dim)
-        self.use_endpoint = bool(use_endpoint)
+        self.mid_dim = int(mid_dim)
         self.mid_source = str(mid_source)
+        self.endpoint_usage = endpoint_usage
+        self.mid_embed_dim = int(mid_embed_dim)
+        self.classifier_head = classifier_head
+        self.prior_mode = prior_mode
+        self.detach_prior = bool(detach_prior)
+        self.prior_enabled = prior_mode != "none"
 
         # ========= 1) backbone =========
         backbone = backbone.lower()
@@ -75,64 +170,75 @@ class UnifiedSWMNet(nn.Module):
         else:
             raise ValueError(f"Unknown backbone: {backbone}")
 
-        # ========= 2) optional endpoint MLP =========
-        # use_endpoint=True:  z = [streamline_global, start_endpoint, end_endpoint]
-        # use_endpoint=False: z = streamline_global only
-        #
-        # This makes the no-endpoint baseline parameter-clean: when endpoint
-        # features are disabled, endpoint_mlp is not instantiated and all heads
-        # are built on top of global_feat_dim instead of global_feat_dim+2*endpoint_dim.
-        if self.use_endpoint:
+        # ========= 2) endpoint encoder =========
+        if self.endpoint_usage != "none":
             self.endpoint_mlp = nn.Sequential(
-                nn.Linear(3, 64),
-                nn.ReLU(),
-                nn.Linear(64, 128),
-                nn.ReLU(),
-                nn.Linear(128, self.endpoint_dim),
+                nn.Linear(3, 32),
+                nn.ReLU(inplace=True),
+                nn.Linear(32, 64),
+                nn.ReLU(inplace=True),
+                nn.Linear(64, self.endpoint_dim),
             )
-            self.fused_dim = self.global_dim + 2 * self.endpoint_dim
         else:
             self.endpoint_mlp = None
-            self.fused_dim = self.global_dim
+
+        self.full_fused_dim = self.global_dim + 2 * self.endpoint_dim
+        self.per_endpoint_mid_dim = self.global_dim + self.endpoint_dim
+
+        if self.endpoint_usage == "all":
+            self.swm_input_dim = self.full_fused_dim
+            self.mid_input_dim = self.full_fused_dim
+            self.final_input_dim = self.full_fused_dim
+        elif self.endpoint_usage == "mid_only":
+            # Endpoint features do not directly enter SWM or final atlas heads.
+            self.swm_input_dim = self.global_dim
+            self.mid_input_dim = self.per_endpoint_mid_dim
+            self.final_input_dim = self.global_dim + self.mid_embed_dim
+        else:
+            self.swm_input_dim = self.global_dim
+            self.mid_input_dim = self.global_dim
+            self.final_input_dim = self.global_dim
+
+        # Exposed for the trainer's print statements.
+        self.fused_dim = self.final_input_dim
 
         # ========= 3) SWM / non-SWM binary head =========
         self.swm_head = nn.Sequential(
-            nn.Linear(self.fused_dim, self.swm_hidden_dim),
-            nn.ReLU(),
+            nn.Linear(self.swm_input_dim, self.swm_hidden_dim),
+            nn.ReLU(inplace=True),
             nn.Linear(self.swm_hidden_dim, 2),
         )
 
-        # ========= 4) mid (yeo or lobe) heads — independent for start / end =====
-        self.mid_dim = mid_dim
-        self.mid_head_start = nn.Linear(self.fused_dim, mid_dim)
-        self.mid_head_end = nn.Linear(self.fused_dim, mid_dim)
+        # ========= 4) mid anatomical heads =========
+        self.mid_head_start = nn.Linear(self.mid_input_dim, self.mid_dim)
+        self.mid_head_end = nn.Linear(self.mid_input_dim, self.mid_dim)
 
-        # ========= 5) direct atlas heads: baseline path z -> ROI =========
+        # Convert mid probabilities into compact anatomical embeddings for final heads.
+        if self.endpoint_usage == "mid_only":
+            self.mid_embed_start = nn.Sequential(
+                nn.Linear(self.mid_dim, self.mid_embed_dim),
+                nn.GELU(),
+                nn.LayerNorm(self.mid_embed_dim),
+            )
+            self.mid_embed_end = nn.Sequential(
+                nn.Linear(self.mid_dim, self.mid_embed_dim),
+                nn.GELU(),
+                nn.LayerNorm(self.mid_embed_dim),
+            )
+        else:
+            self.mid_embed_start = None
+            self.mid_embed_end = None
+
+        # ========= 5) final atlas heads =========
         self.atlas_heads = nn.ModuleDict()
-        for atlas, n_roi in atlas_roi_dims.items():
+        for atlas, n_roi in self.atlas_roi_dims.items():
             self.atlas_heads[atlas] = nn.ModuleDict({
-                "start": nn.Linear(self.fused_dim, n_roi),
-                "end": nn.Linear(self.fused_dim, n_roi),
+                "start": self._make_classifier(self.final_input_dim, n_roi, proto_dim, head_dropout),
+                "end": self._make_classifier(self.final_input_dim, n_roi, proto_dim, head_dropout),
             })
 
-        # ========= 6) gated residual prior weights ==========================
-        # One scalar per (atlas, pos); sigmoid(gate) ∈ [0, 1] is the effective
-        # prior weight. gate_init=-6 gives sigmoid≈0.0025, so the model starts
-        # essentially at the no-prior baseline and only opens the prior path
-        # when it provides positive utility.
-        self.gate = nn.ParameterDict({
-            f"{atlas}_{pos}": nn.Parameter(torch.tensor(float(gate_init)))
-            for atlas in atlas_roi_dims
-            for pos in ["start", "end"]
-        })
-
-        # ========= 7) anatomical overlap matrices M (fixed buffers) ==========
-        # M[A]: (mid_dim, n_roi_A); each row is P(atlas_roi | mid_class)
-        # estimated by voxel overlap on a common cortical region. Registered
-        # as buffer so it moves with .to(device) and is included in state_dict.
-        # File name pattern follows the mid source so yeo / lobe variants do
-        # not collide: M_yeo_to_{atlas}.npy vs M_lobe_to_{atlas}.npy.
-        for atlas, n_roi in atlas_roi_dims.items():
+        # ========= 6) overlap matrices and prior adapters =========
+        for atlas, n_roi in self.atlas_roi_dims.items():
             path = os.path.join(overlap_dir, f"M_{self.mid_source}_to_{atlas}.npy")
             if not os.path.exists(path):
                 raise FileNotFoundError(
@@ -140,53 +246,130 @@ class UnifiedSWMNet(nn.Module):
                     f"Run atlas_overlap/compute_overlap.py --source {self.mid_source} first."
                 )
             M = np.load(path)
-            if M.shape != (mid_dim, n_roi):
+            if M.shape != (self.mid_dim, n_roi):
                 raise ValueError(
-                    f"Shape mismatch for {atlas}: expected ({mid_dim}, {n_roi}), "
-                    f"got {M.shape}"
+                    f"Shape mismatch for {atlas}: expected ({self.mid_dim}, {n_roi}), got {M.shape}"
                 )
             self.register_buffer(f"M_{atlas}", torch.from_numpy(M.astype(np.float32)))
 
-        # ========= 8) temperature and numerical floor ========================
+        self.prior_gates = nn.ParameterDict({
+            f"{atlas}_{pos}": nn.Parameter(torch.tensor(float(gate_init)))
+            for atlas in self.atlas_roi_dims
+            for pos in ["start", "end"]
+        })
+
+        self.prior_adapters = nn.ModuleDict()
+        if prior_mode in {"adapter", "hybrid"}:
+            for atlas, n_roi in self.atlas_roi_dims.items():
+                self.prior_adapters[atlas] = nn.ModuleDict({
+                    "start": PriorAdapter(self.mid_dim, n_roi, prior_hidden_dim, prior_dropout),
+                    "end": PriorAdapter(self.mid_dim, n_roi, prior_hidden_dim, prior_dropout),
+                })
+
         self.register_buffer("temperature", torch.tensor(float(temperature)))
         self.register_buffer("eps", torch.tensor(float(eps)))
 
-    def _prior_log_probs(self, mid_logits, atlas):
-        """
-        log P_prior(atlas_roi | mid prediction, anatomy) for one
-        (mid head output, atlas) pair. The mid head's classes are whatever
-        the configured mid_source is (yeo: 7 networks, lobe: 14 hemi-lobes).
+    def _make_classifier(self, in_dim: int, n_cls: int, proto_dim: int, dropout: float) -> nn.Module:
+        if self.classifier_head == "linear":
+            return nn.Linear(in_dim, n_cls)
+        if self.classifier_head == "cosine":
+            return CosineClassifier(in_dim, n_cls)
+        if self.classifier_head == "prototype":
+            return PrototypeClassifier(in_dim, n_cls, proto_dim=proto_dim, dropout=dropout)
+        raise RuntimeError("unreachable")
 
-        mid_logits is detached so atlas CE does not pollute mid_head or
-        backbone through this path.
-        """
-        mid_prob = F.softmax(mid_logits.detach() / self.temperature, dim=-1)
-        prior = mid_prob @ getattr(self, f"M_{atlas}")    # (B, n_roi)
-        return torch.log(prior + self.eps)
+    def set_prior_enabled(self, enabled: bool):
+        self.prior_enabled = bool(enabled)
+        if not enabled:
+            with torch.no_grad():
+                for p in self.prior_gates.values():
+                    p.fill_(-50.0)
+            for p in self.prior_gates.values():
+                p.requires_grad = False
+            for p in self.prior_adapters.parameters():
+                p.requires_grad = False
 
-    def _apply_gated_residual_prior(self, raw_logits, log_prior, atlas, pos):
-        key = f"{atlas}_{pos}"
-        gate = torch.sigmoid(self.gate[key])
-        return raw_logits + gate * log_prior
+    def _compute_mid_prob_and_log_prior(self, mid_logits: torch.Tensor, atlas: str):
+        src = mid_logits.detach() if self.detach_prior else mid_logits
+        mid_prob = F.softmax(src / self.temperature, dim=-1)
+        prior = mid_prob @ getattr(self, f"M_{atlas}")
+        log_prior = torch.log(prior + self.eps)
+        return mid_prob, log_prior
 
-    def forward(self, fiber):
-        """
-        fiber: (B, 3, N)
-        """
-        global_feat = self.pointnet(fiber)                  # (B, global_dim)
+    def _mid_embedding(self, mid_logits: torch.Tensor, pos: str) -> torch.Tensor:
+        # If prior is disabled in mid_only mode, return a zero bottleneck so no
+        # endpoint-derived information can leak into final heads.
+        if not self.prior_enabled:
+            batch = mid_logits.shape[0]
+            return mid_logits.new_zeros(batch, self.mid_embed_dim)
+        src = mid_logits.detach() if self.detach_prior else mid_logits
+        mid_prob = F.softmax(src / self.temperature, dim=-1)
+        if pos == "start":
+            return self.mid_embed_start(mid_prob)
+        return self.mid_embed_end(mid_prob)
 
-        if self.use_endpoint:
-            start = fiber[:, :, 0]                          # (B, 3)
-            end = fiber[:, :, -1]                           # (B, 3)
-            start_feat = self.endpoint_mlp(start)           # (B, endpoint_dim)
-            end_feat = self.endpoint_mlp(end)               # (B, endpoint_dim)
-            z = torch.cat([global_feat, start_feat, end_feat], dim=1)
+    def _apply_prior(self, raw_logits: torch.Tensor, mid_logits: torch.Tensor,
+                     atlas: str, pos: str) -> torch.Tensor:
+        if (not self.prior_enabled) or self.prior_mode == "none":
+            return raw_logits
+
+        mid_prob, log_prior = self._compute_mid_prob_and_log_prior(mid_logits, atlas)
+        if self.prior_mode == "overlap_log":
+            delta = log_prior
+        elif self.prior_mode == "adapter":
+            delta = self.prior_adapters[atlas][pos](mid_prob, log_prior)
+        elif self.prior_mode == "hybrid":
+            delta = log_prior + self.prior_adapters[atlas][pos](mid_prob, log_prior)
         else:
-            z = global_feat                                 # (B, global_dim)
+            return raw_logits
 
-        swm_logits = self.swm_head(z)
-        mid_start_logits = self.mid_head_start(z)
-        mid_end_logits = self.mid_head_end(z)
+        gate = torch.sigmoid(self.prior_gates[f"{atlas}_{pos}"])
+        return raw_logits + gate * delta
+
+    def forward(self, fiber: torch.Tensor):
+        """fiber: (B, 3, N)"""
+        global_feat = self.pointnet(fiber)
+
+        start_feat = end_feat = None
+        if self.endpoint_usage != "none":
+            start = fiber[:, :, 0]
+            end = fiber[:, :, -1]
+            start_feat = self.endpoint_mlp(start)
+            end_feat = self.endpoint_mlp(end)
+
+        # ----- SWM feature -----
+        if self.endpoint_usage == "all":
+            swm_feat = torch.cat([global_feat, start_feat, end_feat], dim=1)
+        else:
+            swm_feat = global_feat
+        swm_logits = self.swm_head(swm_feat)
+
+        # ----- Mid-layer features -----
+        if self.endpoint_usage == "all":
+            mid_feat_start = torch.cat([global_feat, start_feat, end_feat], dim=1)
+            mid_feat_end = mid_feat_start
+        elif self.endpoint_usage == "mid_only":
+            mid_feat_start = torch.cat([global_feat, start_feat], dim=1)
+            mid_feat_end = torch.cat([global_feat, end_feat], dim=1)
+        else:
+            mid_feat_start = global_feat
+            mid_feat_end = global_feat
+
+        mid_start_logits = self.mid_head_start(mid_feat_start)
+        mid_end_logits = self.mid_head_end(mid_feat_end)
+
+        # ----- Final atlas features -----
+        if self.endpoint_usage == "all":
+            final_feat_start = torch.cat([global_feat, start_feat, end_feat], dim=1)
+            final_feat_end = final_feat_start
+        elif self.endpoint_usage == "mid_only":
+            z_mid_start = self._mid_embedding(mid_start_logits, "start")
+            z_mid_end = self._mid_embedding(mid_end_logits, "end")
+            final_feat_start = torch.cat([global_feat, z_mid_start], dim=1)
+            final_feat_end = torch.cat([global_feat, z_mid_end], dim=1)
+        else:
+            final_feat_start = global_feat
+            final_feat_end = global_feat
 
         outputs = {
             "swm": swm_logits,
@@ -195,38 +378,22 @@ class UnifiedSWMNet(nn.Module):
         }
 
         for atlas, heads in self.atlas_heads.items():
-            log_prior_start = self._prior_log_probs(mid_start_logits, atlas)
-            log_prior_end = self._prior_log_probs(mid_end_logits, atlas)
-
-            raw_start = heads["start"](z)
-            raw_end = heads["end"](z)
-
-            outputs[f"{atlas}_start"] = self._apply_gated_residual_prior(
-                raw_logits=raw_start,
-                log_prior=log_prior_start,
-                atlas=atlas,
-                pos="start",
-            )
-            outputs[f"{atlas}_end"] = self._apply_gated_residual_prior(
-                raw_logits=raw_end,
-                log_prior=log_prior_end,
-                atlas=atlas,
-                pos="end",
-            )
+            raw_start = heads["start"](final_feat_start)
+            raw_end = heads["end"](final_feat_end)
+            outputs[f"{atlas}_start"] = self._apply_prior(raw_start, mid_start_logits, atlas, "start")
+            outputs[f"{atlas}_end"] = self._apply_prior(raw_end, mid_end_logits, atlas, "end")
 
         return outputs
 
     def gate_snapshot(self):
-        """Return raw gate and sigmoid(gate) values for logging."""
         out = {}
-        for k, v in self.gate.items():
-            raw = v.detach().cpu().item()
+        for k, v in self.prior_gates.items():
+            raw = float(v.detach().cpu().item())
             out[k] = {"raw": raw, "sigmoid": float(torch.sigmoid(v.detach()).cpu().item())}
         return out
 
     def prior_weight_snapshot(self):
-        """Return effective prior weights = sigmoid(gate)."""
         return {
             k: float(torch.sigmoid(v.detach()).cpu().item())
-            for k, v in self.gate.items()
+            for k, v in self.prior_gates.items()
         }

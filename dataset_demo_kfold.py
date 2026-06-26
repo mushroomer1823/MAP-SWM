@@ -25,8 +25,8 @@ ATLAS_LIST = [
     "Destrieux",
 ]
 
-# 对于 DWM 样本，atlas / lobe 标签不存在，
-# 因此用 -100 占位，配合 CrossEntropyLoss(ignore_index=-100)
+# DWM samples have no atlas / lobe endpoint labels, so we fill them with -100
+# and rely on CrossEntropyLoss(ignore_index=-100) to skip them.
 IGNORE_INDEX = -100
 
 
@@ -88,33 +88,50 @@ class SWMDemoFiberDataset(Dataset):
         return fiber, atlas_target, lobe_target, subject_id
 
     @staticmethod
-    def _to_zero_based_label(value, col_name):
+    def _build_label_tensor(col_values, col_name, swm_mask):
+        """Vectorized 1-based -> 0-based label conversion with masking.
+
+        For rows where swm_mask is True, the column value must be a positive
+        integer; it is decremented by 1. For rows where swm_mask is False the
+        result is IGNORE_INDEX, and the column value is not inspected.
+
+        Returns a 1D torch.long tensor of length len(col_values).
         """
-        Convert 1-based class label to 0-based class label.
+        n = len(col_values)
+        if n == 0:
+            return torch.zeros(0, dtype=torch.long)
 
-        Example:
-            1  -> 0
-            14 -> 13
-            246 -> 245
+        floats = pd.to_numeric(col_values, errors="coerce").to_numpy(dtype=np.float64)
 
-        This function is only used for ifSWM == 1 rows.
-        """
+        # NaN check only applies to SWM rows; DWM rows are allowed to be missing.
+        nan_in_swm = np.isnan(floats) & swm_mask
+        if nan_in_swm.any():
+            bad = int(np.argmax(nan_in_swm))
+            raise ValueError(f"Missing label in column: {col_name} (row {bad})")
 
-        if pd.isna(value):
-            raise ValueError(f"Missing label in column: {col_name}")
-
-        try:
-            value = int(value)
-        except Exception:
-            raise ValueError(f"Invalid label in column {col_name}: {value}")
-
-        if value <= 0:
+        # Non-integer / non-numeric check on SWM rows.
+        non_int_in_swm = (floats != np.floor(floats)) & swm_mask
+        if non_int_in_swm.any():
+            bad = int(np.argmax(non_int_in_swm))
             raise ValueError(
-                f"Label in column {col_name} should be 1-based positive integer, "
-                f"but got {value}"
+                f"Invalid label in column {col_name}: {col_values.iloc[bad]} (row {bad})"
             )
 
-        return value - 1
+        # Replace NaNs in DWM rows with 0 so the cast to int64 is safe; those
+        # entries are overwritten by IGNORE_INDEX below.
+        safe = np.where(np.isnan(floats), 0.0, floats).astype(np.int64)
+
+        non_positive_in_swm = (safe <= 0) & swm_mask
+        if non_positive_in_swm.any():
+            bad = int(np.argmax(non_positive_in_swm))
+            raise ValueError(
+                f"Label in column {col_name} should be 1-based positive integer, "
+                f"but got {int(safe[bad])} (row {bad})"
+            )
+
+        zero_based = safe - 1
+        out = np.where(swm_mask, zero_based, IGNORE_INDEX).astype(np.int64)
+        return torch.from_numpy(out)
 
     def _load_all(self):
         if not os.path.exists(self.h5_path):
@@ -124,7 +141,7 @@ class SWMDemoFiberDataset(Dataset):
             raise FileNotFoundError(f"CSV file not found: {self.csv_path}")
 
         # =====================================================
-        # 1. 读取 H5
+        # 1. Read H5
         # =====================================================
         with h5py.File(self.h5_path, "r") as f:
             X = f["streamlines"][:]  # [N, 3, 30]
@@ -139,7 +156,7 @@ class SWMDemoFiberDataset(Dataset):
                 subject_ids = None
 
         # =====================================================
-        # 2. 读取 CSV
+        # 2. Read CSV
         # =====================================================
         df = pd.read_csv(self.csv_path)
 
@@ -149,7 +166,7 @@ class SWMDemoFiberDataset(Dataset):
                 f"CSV has {len(df)} rows."
             )
 
-        # 如果 CSV 和 H5 都有 subject_id，则检查顺序是否一致
+        # If both H5 and CSV carry subject_id, verify the ordering matches.
         if subject_ids is not None and "subject_id" in df.columns:
             csv_subject_ids = df["subject_id"].astype(str).values
 
@@ -160,7 +177,7 @@ class SWMDemoFiberDataset(Dataset):
                 )
 
         # =====================================================
-        # 3. 检查必要字段
+        # 3. Check required columns
         # =====================================================
         if "ifSWM" not in df.columns:
             raise KeyError("Missing required column in CSV: ifSWM")
@@ -182,110 +199,51 @@ class SWMDemoFiberDataset(Dataset):
             raise KeyError("Missing column in CSV: lobe_end")
 
         # =====================================================
-        # 4. 构造 atlas targets
+        # 4. SWM / DWM binary label
         # =====================================================
-        atlas_target_lists = {
-            f"{a}_start": []
-            for a in ATLAS_LIST
-        }
-        atlas_target_lists.update({
-            f"{a}_end": []
-            for a in ATLAS_LIST
-        })
+        if_swm_arr = df["ifSWM"].to_numpy()
+        if_swm_float = pd.to_numeric(df["ifSWM"], errors="coerce").to_numpy(dtype=np.float64)
+        invalid = ~np.isin(if_swm_float, [0.0, 1.0])
+        if invalid.any():
+            bad = int(np.argmax(invalid))
+            raise ValueError(
+                f"Invalid ifSWM value at row {bad}: {if_swm_arr[bad]}. "
+                f"Expected 0 or 1."
+            )
+        if_swm = if_swm_float.astype(np.int64)
+        swm_mask = if_swm == 1
 
-        # SWM / DWM 二分类标签
-        atlas_target_lists["swm"] = []
-
-        # =====================================================
-        # 5. 构造 lobe targets，单独保存
-        # =====================================================
-        lobe_target_lists = {
-            "lobe_start": [],
-            "lobe_end": [],
-        }
+        atlas_target_tensors = {"swm": torch.from_numpy(if_swm.copy())}
 
         # =====================================================
-        # 6. 逐行读取标签
+        # 5. Atlas endpoint labels (vectorized)
         # =====================================================
-        for row_idx, row in df.iterrows():
-            if_swm = int(row["ifSWM"])
-
-            if if_swm not in [0, 1]:
-                raise ValueError(
-                    f"Invalid ifSWM value at row {row_idx}: {if_swm}. "
-                    f"Expected 0 or 1."
+        for atlas in ATLAS_LIST:
+            for pos in ("start", "end"):
+                col = f"{atlas}_{pos}"
+                atlas_target_tensors[col] = self._build_label_tensor(
+                    df[col], col, swm_mask,
                 )
 
-            # ---------------------------------------------
-            # SWM label
-            # ---------------------------------------------
-            atlas_target_lists["swm"].append(if_swm)
-
-            # ---------------------------------------------
-            # Atlas endpoint labels
-            # ---------------------------------------------
-            for atlas in ATLAS_LIST:
-                start_col = f"{atlas}_start"
-                end_col = f"{atlas}_end"
-
-                if if_swm == 1:
-                    start_label = self._to_zero_based_label(
-                        row[start_col],
-                        start_col,
-                    )
-                    end_label = self._to_zero_based_label(
-                        row[end_col],
-                        end_col,
-                    )
-                else:
-                    # DWM 样本没有 atlas endpoint 标签
-                    # 训练 atlas 分类时应忽略
-                    start_label = IGNORE_INDEX
-                    end_label = IGNORE_INDEX
-
-                atlas_target_lists[start_col].append(start_label)
-                atlas_target_lists[end_col].append(end_label)
-
-            # ---------------------------------------------
-            # Lobe endpoint labels
-            # ---------------------------------------------
-            if if_swm == 1:
-                lobe_start_label = self._to_zero_based_label(
-                    row["lobe_start"],
-                    "lobe_start",
-                )
-                lobe_end_label = self._to_zero_based_label(
-                    row["lobe_end"],
-                    "lobe_end",
-                )
-            else:
-                # DWM 样本没有 lobe endpoint 标签
-                lobe_start_label = IGNORE_INDEX
-                lobe_end_label = IGNORE_INDEX
-
-            lobe_target_lists["lobe_start"].append(lobe_start_label)
-            lobe_target_lists["lobe_end"].append(lobe_end_label)
+        # =====================================================
+        # 6. Lobe endpoint labels (vectorized)
+        # =====================================================
+        lobe_target_tensors = {}
+        for col in ("lobe_start", "lobe_end"):
+            lobe_target_tensors[col] = self._build_label_tensor(
+                df[col], col, swm_mask,
+            )
 
         # =====================================================
-        # 7. 转成 torch tensor
+        # 7. Streamline tensor
         # =====================================================
         X = torch.tensor(X, dtype=torch.float32)
 
-        atlas_targets = {
-            k: torch.tensor(v, dtype=torch.long)
-            for k, v in atlas_target_lists.items()
-        }
-
-        lobe_targets = {
-            k: torch.tensor(v, dtype=torch.long)
-            for k, v in lobe_target_lists.items()
-        }
-
         # =====================================================
-        # 8. 打印基本信息
+        # 8. Print summary
         # =====================================================
-        n_swm = int((df["ifSWM"] == 1).sum())
-        n_dwm = int((df["ifSWM"] == 0).sum())
+        n_swm = int(swm_mask.sum())
+        n_dwm = int((~swm_mask).sum())
 
         print("Loaded demo dataset")
         print(f"  H5: {self.h5_path}")
@@ -298,21 +256,20 @@ class SWMDemoFiberDataset(Dataset):
         if subject_ids is not None:
             print(f"  Subjects in demo: {sorted(set(subject_ids.tolist()))}")
 
-        return X, atlas_targets, lobe_targets, subject_ids
+        return X, atlas_target_tensors, lobe_target_tensors, subject_ids
 
 
 # =====================================================
-# 普通完整 dataset 构建函数
+# Full-dataset builder
 # =====================================================
 def build_demo_dataset(
     h5_path="/data/hyf/swm_identification/data/demo/demo_swm_streamlines.h5",
     csv_path="/data/hyf/swm_identification/data/demo/demo_atlas_start_end_selected.csv",
 ):
-    """
-    只读取完整数据集，不做 train / val / test 划分。
+    """Load the full dataset with no train/val/test split.
 
-    K-fold 训练时建议先用这个函数得到 full_dataset，
-    再用 build_demo_kfold_datasets 或 build_demo_fold_dataset 生成每一折。
+    For K-fold training, call this first to get the full dataset, then pass
+    it through build_demo_kfold_datasets to materialize per-fold splits.
     """
     return SWMDemoFiberDataset(
         h5_path=h5_path,
@@ -321,7 +278,7 @@ def build_demo_dataset(
 
 
 # =====================================================
-# 原来的普通 train / val / test 划分函数，保留兼容
+# Single train / val / test split (kept for compatibility)
 # =====================================================
 def build_demo_datasets(
     h5_path="/data/hyf/swm_identification/data/demo/demo_swm_streamlines.h5",
@@ -463,12 +420,12 @@ def build_demo_datasets(
 
 
 # =====================================================
-# K-fold 相关工具函数
+# K-fold helpers
 # =====================================================
 def _can_stratify(labels, n_splits):
-    """
-    检查每个类别的样本数是否都不少于 n_splits。
-    StratifiedKFold 要求每个类别至少有 n_splits 个样本。
+    """Return True if every class has at least n_splits samples.
+
+    StratifiedKFold requires at least n_splits samples per class.
     """
     labels = np.asarray(labels)
     _, counts = np.unique(labels, return_counts=True)
@@ -482,11 +439,10 @@ def _safe_train_val_split(
     seed=42,
     stratify=True,
 ):
-    """
-    在当前 fold 的 train_val_idx 中再划分 train / val。
+    """Split a fold's train_val_idx into train / val.
 
-    如果 stratify=True 且类别数量允许，则按照 ifSWM 做分层划分；
-    否则退化为普通随机划分。
+    If stratify=True and every class has enough samples, the split is
+    stratified by ifSWM. Otherwise it falls back to a plain random split.
     """
     train_val_idx = np.asarray(train_val_idx)
 
@@ -523,15 +479,14 @@ def build_demo_kfold_datasets(
     stratify_by_swm=True,
     group_by_subject=False,
 ):
-    """
-    构建 K 折交叉验证所需的数据集划分。
+    """Build K-fold cross-validation splits.
 
-    返回:
+    Returns:
         folds: list[dict]
 
-    每个 fold 是一个 dict:
+    Each fold is a dict:
         {
-            "fold": 第几折，从 1 开始,
+            "fold": fold index, 1-based,
             "train_set": Subset,
             "val_set": Subset,
             "test_set": Subset,
@@ -540,22 +495,22 @@ def build_demo_kfold_datasets(
             "test_indices": list[int],
         }
 
-    参数说明:
+    Args:
         k_fold:
-            K 折数量。
+            Number of folds.
 
         val_ratio:
-            每一折中，从 train_val 部分再划分多少比例作为 val。
-            注意：test 是当前 fold，val 是剩余训练部分里再切出来的。
+            Fraction of each fold's train_val portion used as validation.
+            (test is the held-out fold; val is carved out of the remaining
+            train_val pool.)
 
         stratify_by_swm:
-            是否按照 ifSWM 标签做分层 KFold。
-            推荐 True，因为你的数据同时包含 SWM 和 DWM。
+            Whether to stratify the outer KFold on ifSWM. Recommended True when
+            both SWM and DWM samples are present.
 
         group_by_subject:
-            是否按照 subject_id 做 GroupKFold。
-            如果 True，则同一个 subject 的所有 fiber 不会同时出现在 train 和 test。
-            需要 H5 中存在 subject_id。
+            Whether to do subject-level GroupKFold. When True, all fibers of a
+            given subject stay in the same fold. Requires subject_id in the H5.
     """
 
     full_dataset = build_demo_dataset(
@@ -578,7 +533,7 @@ def build_demo_kfold_datasets(
     swm_labels = full_dataset.atlas_targets["swm"].cpu().numpy()
 
     # -----------------------------------------------------
-    # 1. 生成外层 train_val / test fold
+    # 1. Build outer train_val / test folds
     # -----------------------------------------------------
     if group_by_subject:
         if full_dataset.subject_ids is None:
@@ -617,7 +572,7 @@ def build_demo_kfold_datasets(
             )
 
     # -----------------------------------------------------
-    # 2. 每个 fold 里再划分 train / val
+    # 2. Within each fold, split train_val into train / val
     # -----------------------------------------------------
     folds = []
 
@@ -660,52 +615,9 @@ def build_demo_kfold_datasets(
     return folds
 
 
-def build_demo_fold_dataset(
-    h5_path="/data/hyf/swm_identification/data/demo/demo_swm_streamlines.h5",
-    csv_path="/data/hyf/swm_identification/data/demo/demo_atlas_start_end_selected.csv",
-    k_fold=5,
-    fold_idx=1,
-    val_ratio=0.15,
-    seed=42,
-    shuffle=True,
-    stratify_by_swm=True,
-    group_by_subject=False,
-):
-    """
-    只返回某一折的数据集划分。
-
-    返回:
-        train_set, val_set, test_set
-
-    适合训练代码里这样调用:
-        train_set, val_set, test_set = build_demo_fold_dataset(
-            k_fold=args.k_fold,
-            fold_idx=fold,
-            ...
-        )
-    """
-
-    if fold_idx < 1 or fold_idx > k_fold:
-        raise ValueError(f"fold_idx should be in [1, {k_fold}], got {fold_idx}")
-
-    folds = build_demo_kfold_datasets(
-        h5_path=h5_path,
-        csv_path=csv_path,
-        k_fold=k_fold,
-        val_ratio=val_ratio,
-        seed=seed,
-        shuffle=shuffle,
-        stratify_by_swm=stratify_by_swm,
-        group_by_subject=group_by_subject,
-    )
-
-    fold = folds[fold_idx - 1]
-    return fold["train_set"], fold["val_set"], fold["test_set"]
-
-
 if __name__ == "__main__":
     # =====================================================
-    # 1. 原来的普通划分测试
+    # 1. Single split smoke test
     # =====================================================
     train_set, val_set, test_set = build_demo_datasets(
         train_ratio=0.7,
@@ -738,7 +650,7 @@ if __name__ == "__main__":
     print("  lobe_end:", lobe_target["lobe_end"])
 
     # =====================================================
-    # 2. K-fold 划分测试
+    # 2. K-fold split smoke test
     # =====================================================
     print()
     print("Testing K-fold split:")

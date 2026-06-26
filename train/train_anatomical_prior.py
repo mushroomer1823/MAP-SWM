@@ -3,10 +3,11 @@
 # Trainer for model_anatomical_prior.UnifiedSWMNet.
 #
 # Main features:
-#   1. Uses anatomical prior as a gated residual refinement in the model.
-#   2. Supports configurable feature dimensions through --global_feat_dim and
-#      --endpoint_dim, so changing 1024 -> 512 does not require editing model code.
-#   3. Saves every run under /data/hyf/swm_identification/train_result/<param-tag>/,
+#   1. Supports Light Anatomical Bottleneck: endpoint features can be used only
+#      for mid-layer anatomical labels, not directly by final atlas heads.
+#   2. Supports learnable mid-layer prior adapter and Prototype Classifier heads.
+#   3. Supports configurable model scales and dimensions for lightweight deployment.
+#   4. Saves every run under /data/hyf/swm_identification/train_result/<param-tag>/,
 #      including config, best/final checkpoints, per-epoch metrics, test metrics,
 #      convergence curves, parameter statistics, and learned gate values.
 
@@ -118,6 +119,17 @@ def parse_args():
         "--model_type", type=str, default="dgcnn",
         choices=["pointnet", "pointnet++", "pointmlp", "dgcnn"],
     )
+    parser.add_argument(
+        "--model_scale", type=str, default="custom",
+        choices=["custom", "full", "light", "tiny"],
+        help=(
+            "Convenience presets for lightweight experiments. "
+            "full: gdim=1024, edim=256, mid_embed=128, proto=128; "
+            "light: gdim=512, edim=64, mid_embed=64, proto=128; "
+            "tiny: gdim=256, edim=32, mid_embed=32, proto=64. "
+            "Use custom to keep explicitly provided dimensions."
+        ),
+    )
 
     # ===== dimension control =====
     parser.add_argument(
@@ -126,17 +138,21 @@ def parse_args():
     )
     parser.add_argument(
         "--endpoint_dim", type=int, default=256,
-        help="Endpoint feature dimension after endpoint_mlp. Ignored when --no-use_endpoint is set.",
+        help="Endpoint feature dimension after endpoint_mlp. Ignored when --endpoint_usage=none.",
     )
     parser.add_argument(
-        "--use_endpoint",
-        action=argparse.BooleanOptionalAction,
-        default=True,
+        "--endpoint_usage", type=str, default="mid_only",
+        choices=["all", "mid_only", "none"],
         help=(
-            "Whether to concatenate start/end endpoint features with the "
-            "streamline backbone feature. Use --no-use_endpoint for the "
-            "streamline-only baseline without endpoint features."
+            "How endpoint features are used. all: endpoint features enter mid and final heads "
+            "like the original model. mid_only: endpoint features are used only to predict "
+            "mid-layer labels; final atlas heads receive streamline + mid bottleneck only. "
+            "none: no endpoint encoder."
         ),
+    )
+    parser.add_argument(
+        "--mid_embed_dim", type=int, default=64,
+        help="Dimension of the compact mid-layer anatomical bottleneck embedding.",
     )
     parser.add_argument(
         "--swm_hidden_dim", type=int, default=256,
@@ -182,11 +198,48 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--gate_init", type=float, default=-6.0,
+        "--gate_init", type=float, default=0.0,
         help=(
-            "Initial raw gate value. sigmoid(-6)≈0.0025, so the model starts "
-            "close to the no-prior baseline. Use 0 for stronger initial prior."
+            "Initial raw prior gate value. For the adapter prior, 0 gives sigmoid=0.5. "
+            "Use -6 to start almost identical to the no-prior baseline."
         ),
+    )
+    parser.add_argument(
+        "--prior_mode", type=str, default="adapter",
+        choices=["none", "overlap_log", "adapter", "hybrid"],
+        help=(
+            "Mid-layer prior type. adapter is recommended for Light Anatomical Bottleneck."
+        ),
+    )
+    parser.add_argument(
+        "--prior_hidden_dim", type=int, default=64,
+        help="Hidden dimension of each learnable prior adapter.",
+    )
+    parser.add_argument(
+        "--prior_dropout", type=float, default=0.1,
+        help="Dropout inside the prior adapter.",
+    )
+    parser.add_argument(
+        "--detach_prior",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Whether to detach mid logits before forming mid embedding / prior. "
+            "Default False lets atlas CE shape the mid bottleneck."
+        ),
+    )
+    parser.add_argument(
+        "--classifier_head", type=str, default="prototype",
+        choices=["linear", "cosine", "prototype"],
+        help="Final atlas classifier head. prototype is recommended for lightweight deployment.",
+    )
+    parser.add_argument(
+        "--proto_dim", type=int, default=128,
+        help="Prototype-space dimension for PrototypeClassifier.",
+    )
+    parser.add_argument(
+        "--head_dropout", type=float, default=0.1,
+        help="Dropout used in PrototypeClassifier projection.",
     )
     parser.add_argument(
         "--no_prior", action="store_true", default=False,
@@ -218,7 +271,33 @@ def parse_args():
         ),
     )
 
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    # Scale presets are applied after parsing so explicit custom dimensions remain possible.
+    if args.model_scale == "full":
+        args.global_feat_dim = 1024
+        args.endpoint_dim = 256
+        args.mid_embed_dim = 128
+        args.proto_dim = max(args.proto_dim, 128)
+        args.swm_hidden_dim = max(args.swm_hidden_dim, 256)
+    elif args.model_scale == "light":
+        args.global_feat_dim = 512
+        args.endpoint_dim = 64
+        args.mid_embed_dim = 64
+        args.proto_dim = 128
+        args.swm_hidden_dim = min(args.swm_hidden_dim, 256)
+    elif args.model_scale == "tiny":
+        args.global_feat_dim = 256
+        args.endpoint_dim = 32
+        args.mid_embed_dim = 32
+        args.proto_dim = 64
+        args.swm_hidden_dim = min(args.swm_hidden_dim, 128)
+        args.prior_hidden_dim = min(args.prior_hidden_dim, 32)
+
+    if args.no_prior:
+        args.prior_mode = "none"
+
+    return args
 
 
 # =====================================================
@@ -539,7 +618,15 @@ def build_model(args, device):
         global_feat_dim=args.global_feat_dim,
         endpoint_dim=args.endpoint_dim,
         swm_hidden_dim=args.swm_hidden_dim,
-        use_endpoint=args.use_endpoint,
+        endpoint_usage=args.endpoint_usage,
+        mid_embed_dim=args.mid_embed_dim,
+        classifier_head=args.classifier_head,
+        proto_dim=args.proto_dim,
+        head_dropout=args.head_dropout,
+        prior_mode=args.prior_mode,
+        prior_hidden_dim=args.prior_hidden_dim,
+        prior_dropout=args.prior_dropout,
+        detach_prior=args.detach_prior,
     ).to(device)
     return model
 
@@ -581,15 +668,20 @@ def make_run_dir(args):
         name = safe_tag(args.run_name)
     else:
         atlas_tag = "all" if args.train_atlases == "all" else args.train_atlases.replace(",", "-")
-        prefix = "noPriorAblation" if args.no_prior else "anatomicalPriorGated"
-        endpoint_tag = "withEndpoint" if args.use_endpoint else "streamlineOnly_noEndpoint"
+        prefix = "noPriorAblation" if args.no_prior else "lightAnatomicalBottleneck"
+        endpoint_tag = f"endpoint={args.endpoint_usage}"
         name = "_".join([
             prefix,
+            f"scale={args.model_scale}",
             f"mid={args.mid_layer}",
             endpoint_tag,
+            f"prior={args.prior_mode}",
+            f"head={args.classifier_head}",
+            f"proto={args.proto_dim}",
             f"model={args.model_type}",
             f"gdim={args.global_feat_dim}",
             f"edim={args.endpoint_dim}",
+            f"midemb={args.mid_embed_dim}",
             f"swmhid={args.swm_hidden_dim}",
             f"lr={args.lr}",
             f"wd={args.weight_decay}",
@@ -1208,33 +1300,31 @@ def run_one_split(args, train_set, val_set, test_set, device, save_path, train_a
     print("Dataloaders ready")
 
     model = build_model(args, device)
-    print("Model initialized (gated-residual anatomical prior)")
+    print("Model initialized (Light Anatomical Bottleneck / Prototype Head capable)")
     print(
-        f"  use_endpoint={args.use_endpoint} "
+        f"  model_scale={args.model_scale} endpoint_usage={args.endpoint_usage} "
         f"global_feat_dim={args.global_feat_dim} endpoint_dim={args.endpoint_dim} "
-        f"fused_dim={model.fused_dim}"
+        f"mid_embed_dim={args.mid_embed_dim} final_input_dim={model.fused_dim} "
+        f"classifier_head={args.classifier_head} proto_dim={args.proto_dim} "
+        f"prior_mode={args.prior_mode}"
     )
 
-    # ----- Ablation: --no_prior pins the gate to a large negative value so
-    # sigmoid(gate) ≈ 0 and the prior residual is exactly 0, and skips the
-    # mid CE. Architecture and logging are unchanged. Must happen BEFORE the
-    # optimizer is constructed so Adam sees the frozen state of the gate.
+    # ----- Ablation: --no_prior disables the adapter / prior residual. In
+    # endpoint_usage=mid_only, the final mid bottleneck is zeroed as well, so
+    # endpoint features cannot leak into final atlas heads through the mid path.
     effective_lambda_mid = args.lambda_mid
     if args.no_prior:
         print(
-            "  NO PRIOR ABLATION MODE: freezing gate at -50 (sigmoid≈1.9e-22), "
-            "skipping mid CE (lambda_mid -> 0). Architecture is unchanged."
+            "  NO PRIOR ABLATION MODE: disabling prior adapters and mid bottleneck, "
+            "freezing prior gates, and skipping mid CE (lambda_mid -> 0)."
         )
-        with torch.no_grad():
-            for k in list(model.gate.keys()):
-                model.gate[k].fill_(-50.0)
-                model.gate[k].requires_grad = False
+        model.set_prior_enabled(False)
         effective_lambda_mid = 0.0
 
     print(
         f"  temperature={args.temperature}  lambda_mid={effective_lambda_mid}"
         f"{' (overridden by --no_prior)' if args.no_prior else ''}  "
-        f"gate_init={args.gate_init}"
+        f"gate_init={args.gate_init} detach_prior={args.detach_prior}"
     )
 
     param_summary = save_parameter_summary(model, run_dir)
@@ -1243,13 +1333,10 @@ def run_one_split(args, train_set, val_set, test_set, device, save_path, train_a
         f"trainable_params={param_summary['trainable_params']}"
     )
 
-    # Two parameter groups: gate has weight_decay=0 (a learnable scalar should
-    # not be pulled toward 0 by L2 regularization), everything else uses
-    # args.weight_decay. Frozen gate (in --no_prior mode) still lives in the
-    # optimizer; Adam skips it since requires_grad=False.
+    # Two parameter groups: prior gates have weight_decay=0.
     gate_params, other_params = [], []
     for n, p in model.named_parameters():
-        if n.startswith("gate."):
+        if n.startswith("prior_gates."):
             gate_params.append(p)
         else:
             other_params.append(p)
