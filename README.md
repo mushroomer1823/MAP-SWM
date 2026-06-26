@@ -1,196 +1,101 @@
-# Multi-Atlas Superficial White Matter (SWM) Identification
+# Light Multi-Atlas SWM
 
-Identify superficial white matter (SWM) vs. deep white matter (DWM) streamlines and predict their anatomical endpoint regions across multiple brain atlases simultaneously, using a deep learning model with a gated anatomical prior.
+Deep learning model for identifying superficial white matter (SWM) streamlines and predicting their endpoint regions across multiple brain atlases simultaneously, with a lightweight anatomical bottleneck design.
 
-## Overview
+## What the model does
 
-The project takes brain white matter streamlines (3D fiber tracts reconstructed from diffusion MRI) and performs:
+For each input streamline (a 3D fiber tract, sampled as `[3, 30]` points), the model jointly predicts:
 
-1. **Binary classification** — SWM vs. DWM
-2. **Multi-atlas endpoint mapping** — predict which anatomical ROI each fiber endpoint belongs to, across 6 atlases (Yeo 7 networks, DK, Brainnetome, AAL, Schaefer 100, Destrieux)
-3. **Mid-layer labeling** — predict a coarse anatomical label (7 Yeo networks or 14 hemisphere-lobes) for each endpoint
+1. **SWM vs DWM** — binary classification.
+2. **Mid-layer anatomy** — a coarse anatomical label per endpoint (Yeo 7 networks or 14 hemisphere lobes).
+3. **Per-atlas endpoint ROIs** — the start/end region of the streamline in 6 atlases (Yeo, DK, Brainnetome, AAL, Schaefer-100, Destrieux).
 
-The key idea is a **gated residual anatomical prior**: a coarse "mid layer" prediction (e.g., Yeo network) is converted into an atlas-ROI prior via precomputed overlap matrices, then blended with the direct prediction through a per-head learnable gate. The model can learn to ignore the prior when it is unhelpful for a particular atlas.
+## Design idea
 
-## Project Structure
-
-```
-multi-atlas-swm/
-├── dataset_demo_kfold.py          # Dataset class and data splitting utilities
-├── models/
-│   └── model_anatomical_prior.py  # UnifiedSWMNet model definition
-├── networks/
-│   ├── pointnet.py                # PointNet backbone
-│   ├── pointnetpp.py              # PointNet++ backbone
-│   ├── DGCNN.py                   # DGCNN backbone
-│   └── pointMLP.py                # PointMLP backbone
-├── train/
-│   └── train_anatomical_prior.py  # Training script (main entry point)
-└── atlas_overlap/
-    ├── compute_overlap.py         # Precompute overlap matrices from atlas NIfTI files
-    ├── yeo/                       # Ouput: M_yeo_to_{atlas}.npy matrices
-    └── lobe/                      # Output: M_lobe_to_{atlas}.npy matrices
-```
-
-## Workflow
-
-### Step 1: Precompute Overlap Matrices (one-time preprocessing)
-
-Run `atlas_overlap/compute_overlap.py` to compute conditional probability matrices from atlas NIfTI files:
+Rather than training six independent atlas heads from raw features, the model uses the mid-layer prediction as an **anatomical bottleneck** that injects prior knowledge into every atlas head:
 
 ```
+streamline ─► backbone ─► global feature
+                              │
+endpoint  ──► endpoint MLP ──┤
+                              ├─► mid head ─► P(yeo / lobe)
+                              │         │
+                              │         └─► anatomical prior (via overlap matrix M)
+                              │                       │
+                              └─► atlas heads ◄───────┘  (residual, gated)
+```
+
+Two ingredients make this work:
+
+- **Precomputed overlap matrices `M`**: `M[i, j] = P(atlas_ROI = j | mid_class = i)`, estimated offline from atlas NIfTI files on a shared cortical mask (`atlas_overlap/compute_overlap.py`). Each `M` becomes a registered buffer on the model — it ships with the weights, no path leakage at inference.
+- **Gated residual prior**: each atlas head outputs `atlas_logits = base_head(z) + sigmoid(gate) · prior_delta`. The `gate` is a per-(atlas, position) learnable scalar; the model can open it where the prior helps and close it where it doesn't. Gradient from the prior path is isolated from the mid head, so atlas-CE never corrupts the mid supervision.
+
+The **lightweight variant** (recommended) routes endpoint features only through the mid head, so the final atlas classifiers see just `[global_feature, mid_bottleneck]`. Combined with prototype classifiers (cosine prototypes in a small projected space) instead of giant `Linear(d, n_roi)` heads, the model stays small enough to deploy.
+
+Configurable knobs:
+
+- `--endpoint_usage {all, mid_only, none}` — how endpoint features feed downstream heads.
+- `--classifier_head {linear, cosine, prototype}` — atlas head type.
+- `--prior_mode {none, overlap_log, adapter, hybrid}` — how the prior delta is computed.
+- `--model_scale {full, light, tiny, custom}` — preset dimension bundles.
+- `--no_prior` — ablation: freezes gate to 0 and skips mid CE.
+
+## Project layout
+
+```
+dataset_demo_kfold.py              # Dataset, single split, K-fold (subject/stratified/random)
+models/model_anatomical_prior.py   # UnifiedSWMNet + prior adapters + prototype heads
+networks/                          # Point-cloud backbones (PointNet, PointNet++, DGCNN, PointMLP)
+train/train_anatomical_prior.py    # Full trainer with metrics, k-fold, logging
+atlas_overlap/
+  compute_overlap.py               # Build M_{mid}_to_{atlas}.npy from atlas NIfTIs
+  {yeo,lobe}/                      # Precomputed overlap matrices
+```
+
+## Usage
+
+```bash
+# 1. Precompute overlap matrices (one-time, needs atlas NIfTI files)
 python atlas_overlap/compute_overlap.py --source yeo
 python atlas_overlap/compute_overlap.py --source lobe
-```
 
-This loads multiple brain atlas parcellations, resamples them to a common reference grid (182×218×182 at 1mm³ isotropic), finds the intersection of labeled voxels across all atlases ("common cortical region"), and computes:
-
-**M\[i, j\] = P(atlas_ROI = j | mid_class = i)**
-
-estimated by voxel counts, saved as `.npy` files. Results are stored under `atlas_overlap/{yeo,lobe}/`.
-
-### Step 2: Prepare Data
-
-Data consists of two files:
-
-- **H5 file**: streamlines array of shape `[N, 3, 30]` (N fibers, each with 30 sample points in 3D space), plus optional `subject_id`
-- **CSV file**: Same ordering as H5, containing:
-  - `ifSWM` — binary label (1=SWM, 0=DWM)
-  - `{atlas}_start` / `{atlas}_end` — 1-based ROI labels for each of 6 atlases (valid only for SWM fibers)
-  - `lobe_start` / `lobe_end` — 1-based lobe labels (valid only for SWM fibers)
-
-The dataset class `SWMDemoFiberDataset` handles:
-- Converting 1-based labels to 0-based
-- Setting DWM fiber labels to `-100` (ignored in loss computation)
-- Data splitting with support for random, stratified-by-SWM, and subject-level grouping strategies
-- K-fold cross validation
-
-### Step 3: Train the Model
-
-Run `train/train_anatomical_prior.py`:
-
-```
+# 2. Train (recommended lightweight configuration)
 python train/train_anatomical_prior.py \
-    --model_type dgcnn \
-    --mid_layer yeo \
-    --global_feat_dim 1024 \
-    --batch_size 2048 \
-    --epochs 50 \
+    --model_type pointnet \
+    --model_scale light \
+    --endpoint_usage mid_only \
+    --mid_layer lobe \
+    --prior_mode adapter \
+    --classifier_head prototype \
+    --lambda_mid 0.3 \
+    --gate_init 0 \
+    --temperature 1.5 \
     --k_fold 5 \
-    --group_by_subject \
-    --gpu 2
+    --group_by_subject
 ```
 
-Key parameters:
+Each run writes to a timestamped folder under `--result_root` with the config, checkpoints, per-epoch metrics, per-subject and pair-level test metrics, convergence curves, and learned gate trajectories.
 
-| Parameter | Description |
-|---|---|
-| `--model_type` | Backbone: `pointnet`, `pointnet++`, `dgcnn`, `pointmlp` |
-| `--mid_layer` | Mid-layer source: `yeo` (7 classes) or `lobe` (14 classes) |
-| `--k_fold` | K for cross-validation (≤1 uses single split) |
-| `--group_by_subject` | Keep all fibers of a subject in the same split |
-| `--no_prior` | Ablation: freeze gate to 0, disabling the anatomical prior |
-| `--gate_init` | Initial raw gate value (default -6 → sigmoid≈0.0025) |
-| `--lambda_mid` | Weight of mid-layer CE loss |
-| `--temperature` | Softmax temperature for prior softening (<1 sharpens, >1 softens) |
+Common ablations:
 
-### Step 4: Outputs
+```bash
+# Full baseline, no prior
+python train/train_anatomical_prior.py --model_scale full --endpoint_usage all --classifier_head linear --no_prior
 
-Each run creates a timestamped directory under `--result_root` containing:
+# Lightweight bottleneck with adapter prior
+python train/train_anatomical_prior.py --model_scale light --endpoint_usage mid_only --classifier_head prototype --prior_mode adapter
 
-- `config.json` — all arguments
-- `best_model.pth` / `final_model.pth` — model checkpoints
-- `epoch_metrics_*.csv` — per-epoch train/val metrics for every head
-- `test_metrics.csv` — per-head test metrics (accuracy, precision, recall, F1)
-- `test_metrics_per_subject_*.csv` — subject-level aggregated metrics
-- `test_metrics_pair_*.csv` — pair-level metrics (start×end composite class)
-- `convergence_*.png` — loss, F1, and accuracy curves
-- `prior_gate_*.csv` — learned gate values per epoch
-- `result_summary.json` / `kfold_result_summary.json`
-- `runtime.json` — training wall-clock time
-
-## Model Architecture
-
+# Tiny deployable
+python train/train_anatomical_prior.py --model_scale tiny --endpoint_usage mid_only --classifier_head prototype --prior_mode adapter
 ```
-Fiber (B, 3, 30)
-    │
-    ├─► Backbone (PointNet/DGCNN/etc.) ─► global_feat (B, 1024)
-    │
-    ├─► Endpoint MLP (optional) ─► start_feat, end_feat (B, 256 each)
-    │
-    └─► [global_feat | start_feat | end_feat] = z (B, fused_dim)
-            │
-            ├─► SWM Head ─► swm_logits (B, 2)
-            │
-            ├─► Mid Head (start/end) ─► mid_logits (B, 7 or 14)
-            │       │
-            │       └─► softmax(mid_logits/τ) @ M ─► log_prior (anatomical prior)
-            │
-            └─► Atlas Heads (start/end × 6 atlases) ─► raw_logits
-                    │
-                    └─► raw_logits + sigmoid(gate) × log_prior ─► final_logits
-```
-
-The gated residual formulation:
-
-```
-atlas_logits = base_head(z) + sigmoid(gate) × log( softmax(mid_logits/τ) @ M )
-```
-
-- **gate**: per-(atlas, position) learnable scalar, initialized at -6 (≈0.0025 effective weight)
-- **gradient isolation**: mid_logits are detached when forming the prior, so atlas CE does not backpropagate into the mid head through the prior path
-- The model can learn to open the gate (positive drift) when the anatomical prior helps, or keep it closed (negative drift) when it doesn't
 
 ## Atlases
 
-| Atlas | # ROIs | Description |
-|---|---|---|
-| Yeo | 7 | Resting-state functional networks |
-| DK (Desikan-Killiany) | 70 | Gyral-based anatomical parcellation |
-| Brainnetome | 246 | Connectivity-based parcellation |
-| AAL | 116 | Automated Anatomical Labeling |
-| Schaefer 100 | 100 | Functional parcellation (100 parcels) |
-| Destrieux | 75 | Sulcal/gyral anatomical parcellation |
-
-## Light Anatomical Bottleneck version
-
-This version adds a deployable lightweight hierarchical model for multi-atlas SWM classification.
-The recommended configuration is:
-
-```bash
-python train/train_anatomical_prior.py \
-  --model_type pointnet \
-  --model_scale light \
-  --endpoint_usage mid_only \
-  --mid_layer lobe \
-  --prior_mode adapter \
-  --classifier_head prototype \
-  --lambda_mid 0.3 \
-  --gate_init 0 \
-  --temperature 1.5
-```
-
-Key switches:
-
-- `--endpoint_usage all`: original-style setting; endpoint features enter final atlas heads directly.
-- `--endpoint_usage mid_only`: endpoint features only predict the intermediate anatomical layer; final atlas heads receive streamline global feature + compact mid-layer bottleneck.
-- `--endpoint_usage none`: no endpoint encoder.
-- `--classifier_head prototype`: replaces large linear final atlas classifiers with compact cosine prototype classifiers.
-- `--prior_mode adapter`: uses a learnable adapter from mid probability + overlap prior to residual atlas logits.
-- `--model_scale full/light/tiny`: presets for feature dimensions.
-
-Recommended ablations:
-
-```bash
-# Strong full baseline
-python train/train_anatomical_prior.py --model_scale full --endpoint_usage all --classifier_head linear --no_prior
-
-# Lightweight bottleneck with prior adapter and prototype heads
-python train/train_anatomical_prior.py --model_scale light --endpoint_usage mid_only --classifier_head prototype --prior_mode adapter
-
-# Clean bottleneck ablation: endpoint cannot affect final heads because the prior/mid bottleneck is disabled
-python train/train_anatomical_prior.py --model_scale light --endpoint_usage mid_only --classifier_head prototype --no_prior
-
-# Tiny deployable version
-python train/train_anatomical_prior.py --model_scale tiny --endpoint_usage mid_only --classifier_head prototype --prior_mode adapter
-```
+| Atlas         | # ROIs | Description                                |
+|---------------|--------|--------------------------------------------|
+| Yeo           | 7      | Resting-state functional networks          |
+| DK            | 70     | Desikan-Killiany gyral parcellation        |
+| Brainnetome   | 246    | Connectivity-based parcellation            |
+| AAL           | 116    | Automated Anatomical Labeling              |
+| Schaefer-100  | 100    | Functional parcellation (100 parcels)      |
+| Destrieux     | 75     | Sulcal/gyral anatomical parcellation       |
