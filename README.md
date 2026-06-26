@@ -74,20 +74,7 @@ python train/train_anatomical_prior.py \
     --group_by_subject
 ```
 
-Each run writes to a timestamped folder under `--result_root` with the config, checkpoints, per-epoch metrics, per-subject and pair-level test metrics, convergence curves, and learned gate trajectories.
-
-Common ablations:
-
-```bash
-# Full baseline, no prior
-python train/train_anatomical_prior.py --model_scale full --endpoint_usage all --classifier_head linear --no_prior
-
-# Lightweight bottleneck with adapter prior
-python train/train_anatomical_prior.py --model_scale light --endpoint_usage mid_only --classifier_head prototype --prior_mode adapter
-
-# Tiny deployable
-python train/train_anatomical_prior.py --model_scale tiny --endpoint_usage mid_only --classifier_head prototype --prior_mode adapter
-```
+Each run writes to a timestamped folder under `--result_root` with the config, checkpoints, per-epoch metrics, per-subject and pair-level test metrics, convergence curves, and learned gate trajectories.\
 
 ## Atlases
 
