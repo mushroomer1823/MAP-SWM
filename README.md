@@ -1,6 +1,6 @@
 # MAP-SWM 
 
-MAP-SWM (Multi-Atlas Prior-guided SWM extraction frameword) provides a lightweight deep learning framework for superficial white matter (SWM) streamline identification and multi-atlas endpoint classification.
+MAP-SWM (Multi-Atlas Prior-guided Superficial White Matter extraction frameword) provides a lightweight deep learning framework for superficial white matter (SWM) streamline identification and multi-atlas endpoint classification.
 
 Given an input streamline represented as a 3D point sequence, the model jointly predicts:
 
