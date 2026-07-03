@@ -115,7 +115,7 @@ class UnifiedSWMNet(nn.Module):
         backbone: str,
         mid_dim: int = 7,
         mid_source: str = "yeo",
-        overlap_dir: str = "/home/heyifei/codes/test/atlas_overlap",
+        overlap_dir: str = "./atlas_overlap",
         temperature: float = 1.0,
         gate_init: float = 0.0,
         global_feat_dim: int = 512,

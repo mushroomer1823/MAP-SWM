@@ -22,18 +22,18 @@ Building common region:
   ∩ Destrieux   : 643386 (70.66% of previous)
 
 Final common region size: 643386 voxels
-Saved common region mask -> /home/heyifei/codes/test/atlas_overlap/common_region.npy
+Saved common region mask -> atlas_overlap/yeo/common_region.npy
 
 Computing overlap matrices:
   [yeo         ] M shape=(7, 7)  row_sum_min=1.000000  row_sum_max=1.000000
-    saved -> /home/heyifei/codes/test/atlas_overlap/M_yeo_to_yeo.npy
+    saved -> atlas_overlap/yeo/M_yeo_to_yeo.npy
   [DK          ] M shape=(7, 70)  row_sum_min=1.000000  row_sum_max=1.000000
-    saved -> /home/heyifei/codes/test/atlas_overlap/M_yeo_to_DK.npy
+    saved -> atlas_overlap/yeo/M_yeo_to_DK.npy
   [Brainnetome ] M shape=(7, 246)  row_sum_min=1.000000  row_sum_max=1.000000
-    saved -> /home/heyifei/codes/test/atlas_overlap/M_yeo_to_Brainnetome.npy
+    saved -> atlas_overlap/yeo/M_yeo_to_Brainnetome.npy
   [AAL         ] M shape=(7, 116)  row_sum_min=1.000000  row_sum_max=1.000000
-    saved -> /home/heyifei/codes/test/atlas_overlap/M_yeo_to_AAL.npy
+    saved -> atlas_overlap/yeo/M_yeo_to_AAL.npy
   [schaefer_100] M shape=(7, 100)  row_sum_min=1.000000  row_sum_max=1.000000
-    saved -> /home/heyifei/codes/test/atlas_overlap/M_yeo_to_schaefer_100.npy
+    saved -> atlas_overlap/yeo/M_yeo_to_schaefer_100.npy
   [Destrieux   ] M shape=(7, 75)  row_sum_min=1.000000  row_sum_max=1.000000
-    saved -> /home/heyifei/codes/test/atlas_overlap/M_yeo_to_Destrieux.npy
+    saved -> atlas_overlap/yeo/M_yeo_to_Destrieux.npy

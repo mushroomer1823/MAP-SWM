@@ -33,8 +33,8 @@ IGNORE_INDEX = -100
 class SWMDemoFiberDataset(Dataset):
     def __init__(
         self,
-        h5_path="/data/hyf/swm_identification/data/demo/demo_swm_streamlines.h5",
-        csv_path="/data/hyf/swm_identification/data/demo/demo_atlas_start_end_selected.csv",
+        h5_path="data/demo/demo_swm_streamlines.h5",
+        csv_path="data/demo/demo_atlas_start_end_selected.csv",
     ):
         """
         Demo dataset for SWM/DWM fiber classification.
@@ -263,8 +263,8 @@ class SWMDemoFiberDataset(Dataset):
 # Full-dataset builder
 # =====================================================
 def build_demo_dataset(
-    h5_path="/data/hyf/swm_identification/data/demo/demo_swm_streamlines.h5",
-    csv_path="/data/hyf/swm_identification/data/demo/demo_atlas_start_end_selected.csv",
+    h5_path="data/demo/demo_swm_streamlines.h5",
+    csv_path="data/demo/demo_atlas_start_end_selected.csv",
 ):
     """Load the full dataset with no train/val/test split.
 
@@ -281,8 +281,8 @@ def build_demo_dataset(
 # Single train / val / test split (kept for compatibility)
 # =====================================================
 def build_demo_datasets(
-    h5_path="/data/hyf/swm_identification/data/demo/demo_swm_streamlines.h5",
-    csv_path="/data/hyf/swm_identification/data/demo/demo_atlas_start_end_selected.csv",
+    h5_path="data/demo/demo_swm_streamlines.h5",
+    csv_path="data/demo/demo_atlas_start_end_selected.csv",
     train_ratio=0.7,
     val_ratio=0.15,
     seed=42,
@@ -470,8 +470,8 @@ def _safe_train_val_split(
 
 
 def build_demo_kfold_datasets(
-    h5_path="/data/hyf/swm_identification/data/demo/demo_swm_streamlines.h5",
-    csv_path="/data/hyf/swm_identification/data/demo/demo_atlas_start_end_selected.csv",
+    h5_path="data/demo/demo_swm_streamlines.h5",
+    csv_path="data/demo/demo_atlas_start_end_selected.csv",
     k_fold=5,
     val_ratio=0.15,
     seed=42,

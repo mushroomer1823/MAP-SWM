@@ -6,9 +6,9 @@
 # (intersection of mask AND every atlas's labelled voxels).
 #
 # Output (per --source):
-#   /home/heyifei/codes/test/atlas_overlap/{source}/M_{source}_to_{atlas}.npy
-#   /home/heyifei/codes/test/atlas_overlap/{source}/common_region.npy  (uint8 mask)
-#   /home/heyifei/codes/test/atlas_overlap/{source}/summary.txt
+#   atlas_overlap/{source}/M_{source}_to_{atlas}.npy
+#   atlas_overlap/{source}/common_region.npy  (uint8 mask)
+#   atlas_overlap/{source}/summary.txt
 
 import argparse
 import os
@@ -16,8 +16,8 @@ import numpy as np
 import nibabel as nib
 from nibabel.processing import resample_from_to
 
-ATLAS_DIR = "/home/heyifei/data/test/atlases"
-OUT_DIR = "/home/heyifei/codes/test/atlas_overlap"
+ATLAS_DIR = "data/atlases"
+OUT_DIR = "./atlas_overlap"
 os.makedirs(OUT_DIR, exist_ok=True)
 
 ATLAS_FILES = {

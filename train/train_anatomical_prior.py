@@ -7,7 +7,7 @@
 #      for mid-layer anatomical labels, not directly by final atlas heads.
 #   2. Supports learnable mid-layer prior adapter and Prototype Classifier heads.
 #   3. Supports configurable model scales and dimensions for lightweight deployment.
-#   4. Saves every run under /data/hyf/swm_identification/train_result/<param-tag>/,
+#   4. Saves every run under train_result/<param-tag>/,
 #      including config, best/final checkpoints, per-epoch metrics, test metrics,
 #      convergence curves, parameter statistics, and learned gate values.
 
@@ -68,11 +68,11 @@ def parse_args():
     # ===== data =====
     parser.add_argument(
         "--h5_path", type=str,
-        default="/data/hyf/swm_identification/data/demo/All_swm_dwm_streamlines.h5",
+        default="data/demo/All_swm_dwm_streamlines.h5",
     )
     parser.add_argument(
         "--csv_path", type=str,
-        default="/data/hyf/swm_identification/data/demo/All_swm_dwm_atlas_start_end_selected_with_lobe.csv",
+        default="data/demo/All_swm_dwm_atlas_start_end_selected_with_lobe.csv",
     )
     parser.add_argument("--train_ratio", type=float, default=0.7)
     parser.add_argument("--val_ratio", type=float, default=0.15)
@@ -179,7 +179,7 @@ def parse_args():
     )
     parser.add_argument(
         "--overlap_dir", type=str,
-        default="/home/hyf/swm_identification/multi-atlas-swm/atlas_overlap",
+        default="./atlas_overlap",
         help=(
             "Parent directory holding the per-source overlap subfolders "
             "{yeo,lobe}/. The actual matrix path is "
@@ -256,7 +256,7 @@ def parse_args():
     # ===== save / result logging =====
     parser.add_argument(
         "--result_root", type=str,
-        default="/data/hyf/swm_identification/train_result",
+        default="./train_result",
         help="Root directory for all training outputs.",
     )
     parser.add_argument(

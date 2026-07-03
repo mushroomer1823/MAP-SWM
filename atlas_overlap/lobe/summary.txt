@@ -1,5 +1,5 @@
 Source atlas: lobe  (dim=14)
-Output dir:   /home/heyifei/codes/test/atlas_overlap/lobe
+Output dir:   atlas_overlap/lobe
 Reference grid from 'DK': shape=(182, 218, 182)
 Reference affine:
 [[  -1.    0.    0.   90.]
@@ -26,20 +26,20 @@ Building common region:
   ∩ Destrieux   : 643386 (70.66% of previous)
 
 Final common region size: 643386 voxels
-Saved common region mask -> /home/heyifei/codes/test/atlas_overlap/lobe/common_region.npy
+Saved common region mask -> atlas_overlap/lobe/common_region.npy
 
 Computing overlap matrices:
   [yeo         ] M shape=(14, 7)  row_sum_min=1.000000  row_sum_max=1.000000
-    saved -> /home/heyifei/codes/test/atlas_overlap/lobe/M_lobe_to_yeo.npy
+    saved -> atlas_overlap/lobe/M_lobe_to_yeo.npy
   [lobe        ] M shape=(14, 14)  row_sum_min=1.000000  row_sum_max=1.000000
-    saved -> /home/heyifei/codes/test/atlas_overlap/lobe/M_lobe_to_lobe.npy
+    saved -> atlas_overlap/lobe/M_lobe_to_lobe.npy
   [DK          ] M shape=(14, 70)  row_sum_min=1.000000  row_sum_max=1.000000
-    saved -> /home/heyifei/codes/test/atlas_overlap/lobe/M_lobe_to_DK.npy
+    saved -> atlas_overlap/lobe/M_lobe_to_DK.npy
   [Brainnetome ] M shape=(14, 246)  row_sum_min=1.000000  row_sum_max=1.000000
-    saved -> /home/heyifei/codes/test/atlas_overlap/lobe/M_lobe_to_Brainnetome.npy
+    saved -> atlas_overlap/lobe/M_lobe_to_Brainnetome.npy
   [AAL         ] M shape=(14, 116)  row_sum_min=1.000000  row_sum_max=1.000000
-    saved -> /home/heyifei/codes/test/atlas_overlap/lobe/M_lobe_to_AAL.npy
+    saved -> atlas_overlap/lobe/M_lobe_to_AAL.npy
   [schaefer_100] M shape=(14, 100)  row_sum_min=1.000000  row_sum_max=1.000000
-    saved -> /home/heyifei/codes/test/atlas_overlap/lobe/M_lobe_to_schaefer_100.npy
+    saved -> atlas_overlap/lobe/M_lobe_to_schaefer_100.npy
   [Destrieux   ] M shape=(14, 75)  row_sum_min=1.000000  row_sum_max=1.000000
-    saved -> /home/heyifei/codes/test/atlas_overlap/lobe/M_lobe_to_Destrieux.npy
+    saved -> atlas_overlap/lobe/M_lobe_to_Destrieux.npy
